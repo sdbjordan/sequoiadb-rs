@@ -1,7 +1,8 @@
 pub mod btree;
-pub mod key;
-pub mod definition;
 pub mod cursor;
+pub mod definition;
+pub mod key;
+pub mod node;
 
 pub use btree::BTreeIndex;
 pub use key::{IndexKey, KeyRange};

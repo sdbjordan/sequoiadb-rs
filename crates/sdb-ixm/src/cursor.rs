@@ -7,6 +7,10 @@ pub struct IndexCursor {
 }
 
 impl IndexCursor {
+    pub fn new(results: Vec<RecordId>) -> Self {
+        Self { results, pos: 0 }
+    }
+
     pub fn empty() -> Self {
         Self {
             results: Vec::new(),
