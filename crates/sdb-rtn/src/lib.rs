@@ -4,4 +4,4 @@ pub mod executor;
 
 pub use context::Context;
 pub use cursor::Cursor;
-pub use executor::Executor;
+pub use executor::{CollectionHandle, DefaultExecutor, Executor};

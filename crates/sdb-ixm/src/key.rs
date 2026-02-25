@@ -18,6 +18,18 @@ pub struct KeyRange {
     pub end_inclusive: bool,
 }
 
+impl KeyRange {
+    /// Full-range scan with no bounds.
+    pub fn all() -> Self {
+        Self {
+            start: None,
+            end: None,
+            start_inclusive: true,
+            end_inclusive: true,
+        }
+    }
+}
+
 // --- Type tag constants for key encoding ---
 const TAG_NULL: u8 = 0;
 const TAG_MIN_KEY: u8 = 1;

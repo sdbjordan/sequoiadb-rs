@@ -314,6 +314,35 @@ impl Inner {
         self.delete_impl(rid)?;
         self.insert_impl(doc, mb_id)
     }
+
+    fn scan_impl(&self) -> Vec<(RecordId, Document)> {
+        let mut results = Vec::new();
+        let mut extent_page = self.first_extent;
+        while extent_page >= 0 {
+            let page = &self.pages[extent_page as usize];
+            let mut off = extent::first_record_offset(&page.data);
+            while off >= 0 {
+                let offset = off as usize;
+                let flag = record::record_flag(&page.data, offset);
+                let next = record::record_next_offset(&page.data, offset);
+                if flag != FLAG_DELETED {
+                    let payload = record::record_payload(&page.data, offset);
+                    if let Ok(doc) = Document::from_bytes(payload) {
+                        results.push((
+                            RecordId {
+                                extent_id: extent_page as u32,
+                                offset: off as u32,
+                            },
+                            doc,
+                        ));
+                    }
+                }
+                off = next;
+            }
+            extent_page = extent::next_extent(&page.data);
+        }
+        results
+    }
 }
 
 // ── Public API (acquires lock) ──
@@ -338,6 +367,11 @@ impl StorageUnit {
         let mut inner = self.inner.lock().unwrap();
         inner.update_impl(rid, doc, self.cl_id)
     }
+
+    pub fn scan(&self) -> Vec<(RecordId, Document)> {
+        let inner = self.inner.lock().unwrap();
+        inner.scan_impl()
+    }
 }
 
 // ── StorageEngine trait impl ──
@@ -357,6 +391,10 @@ impl crate::engine::StorageEngine for StorageUnit {
 
     fn update(&self, rid: RecordId, doc: &Document) -> Result<RecordId> {
         StorageUnit::update(self, rid, doc)
+    }
+
+    fn scan(&self) -> Vec<(RecordId, Document)> {
+        StorageUnit::scan(self)
     }
 }
 
@@ -492,6 +530,35 @@ mod tests {
 
         let found = su.find(rid2).unwrap();
         assert_eq!(found.get("a").unwrap(), &Value::String("2".into()));
+    }
+
+    #[test]
+    fn scan_empty_collection() {
+        let su = StorageUnit::new(1, 1);
+        let results = su.scan();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn scan_skips_deleted_records() {
+        let su = StorageUnit::new(1, 1);
+        let mut rids = Vec::new();
+        for i in 0..5 {
+            let doc = make_doc("i", &i.to_string());
+            rids.push(su.insert(&doc).unwrap());
+        }
+        // Delete records at index 1 and 3
+        su.delete(rids[1]).unwrap();
+        su.delete(rids[3]).unwrap();
+
+        let results = su.scan();
+        assert_eq!(results.len(), 3);
+        let scan_rids: Vec<RecordId> = results.iter().map(|(r, _)| *r).collect();
+        assert!(scan_rids.contains(&rids[0]));
+        assert!(!scan_rids.contains(&rids[1]));
+        assert!(scan_rids.contains(&rids[2]));
+        assert!(!scan_rids.contains(&rids[3]));
+        assert!(scan_rids.contains(&rids[4]));
     }
 
     #[test]

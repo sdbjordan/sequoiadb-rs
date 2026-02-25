@@ -7,4 +7,5 @@ pub trait StorageEngine: Send + Sync {
     fn find(&self, rid: RecordId) -> Result<Document>;
     fn delete(&self, rid: RecordId) -> Result<()>;
     fn update(&self, rid: RecordId, doc: &Document) -> Result<RecordId>;
+    fn scan(&self) -> Vec<(RecordId, Document)>;
 }

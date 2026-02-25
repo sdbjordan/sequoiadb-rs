@@ -19,6 +19,16 @@ impl Cursor {
         }
     }
 
+    /// Create a cursor pre-loaded with results (one-shot, no incremental fetch).
+    pub fn with_results(context_id: i64, results: Vec<Document>) -> Self {
+        Self {
+            context_id,
+            buffer: results,
+            pos: 0,
+            exhausted: true,
+        }
+    }
+
     pub fn next(&mut self) -> Result<Option<Document>> {
         if self.pos < self.buffer.len() {
             let doc = self.buffer[self.pos].clone();
