@@ -14,7 +14,7 @@ pub struct SelectStatement {
     pub columns: Vec<String>,
     pub table: String,
     pub condition: Option<String>,
-    pub order_by: Vec<(String, bool)>,  // (column, ascending)
+    pub order_by: Vec<(String, bool)>, // (column, ascending)
     pub limit: Option<i64>,
     pub offset: Option<i64>,
 }

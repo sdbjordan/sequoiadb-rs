@@ -222,13 +222,11 @@ fn decode_value(data: &[u8]) -> Result<(Value, usize)> {
             if data.len() < 5 {
                 return Err(SdbError::InvalidBson);
             }
-            let len =
-                u32::from_le_bytes([data[1], data[2], data[3], data[4]]) as usize;
+            let len = u32::from_le_bytes([data[1], data[2], data[3], data[4]]) as usize;
             if data.len() < 5 + len {
                 return Err(SdbError::InvalidBson);
             }
-            let s = std::str::from_utf8(&data[5..5 + len])
-                .map_err(|_| SdbError::InvalidBson)?;
+            let s = std::str::from_utf8(&data[5..5 + len]).map_err(|_| SdbError::InvalidBson)?;
             Ok((Value::String(s.to_string()), 5 + len))
         }
         _ => Err(SdbError::InvalidBson),
@@ -246,7 +244,7 @@ mod tests {
             Value::String("hello".to_string()),
             Value::Null,
             Value::Boolean(true),
-            Value::Double(3.14),
+            Value::Double(3.125),
             Value::Int64(i64::MAX),
         ]);
         let encoded = key.encode();
@@ -269,7 +267,10 @@ mod tests {
     fn test_compare_values_type_order() {
         // MinKey < Null < Number < String < Boolean < MaxKey
         assert_eq!(compare_values(&Value::MinKey, &Value::Null), Ordering::Less);
-        assert_eq!(compare_values(&Value::Null, &Value::Int32(0)), Ordering::Less);
+        assert_eq!(
+            compare_values(&Value::Null, &Value::Int32(0)),
+            Ordering::Less
+        );
         assert_eq!(
             compare_values(&Value::Int32(0), &Value::String("a".into())),
             Ordering::Less

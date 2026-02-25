@@ -252,7 +252,10 @@ mod tests {
 
     #[test]
     fn set_new_field() {
-        let rule = doc(&[("$set", Value::Document(doc(&[("z", Value::String("new".into()))])))]);
+        let rule = doc(&[(
+            "$set",
+            Value::Document(doc(&[("z", Value::String("new".into()))])),
+        )]);
         let m = Modifier::new(rule).unwrap();
         let input = doc(&[("x", Value::Int32(1))]);
         let result = m.modify(&input).unwrap();
@@ -262,7 +265,10 @@ mod tests {
 
     #[test]
     fn unset_field() {
-        let rule = doc(&[("$unset", Value::Document(doc(&[("x", Value::String("".into()))])))]);
+        let rule = doc(&[(
+            "$unset",
+            Value::Document(doc(&[("x", Value::String("".into()))])),
+        )]);
         let m = Modifier::new(rule).unwrap();
         let input = doc(&[("x", Value::Int32(1)), ("y", Value::Int32(2))]);
         let result = m.modify(&input).unwrap();
@@ -272,7 +278,10 @@ mod tests {
 
     #[test]
     fn unset_missing_field() {
-        let rule = doc(&[("$unset", Value::Document(doc(&[("z", Value::String("".into()))])))]);
+        let rule = doc(&[(
+            "$unset",
+            Value::Document(doc(&[("z", Value::String("".into()))])),
+        )]);
         let m = Modifier::new(rule).unwrap();
         let input = doc(&[("x", Value::Int32(1))]);
         let result = m.modify(&input).unwrap();
@@ -323,7 +332,10 @@ mod tests {
 
     #[test]
     fn unset_nested_path() {
-        let rule = doc(&[("$unset", Value::Document(doc(&[("a.b", Value::String("".into()))])))]);
+        let rule = doc(&[(
+            "$unset",
+            Value::Document(doc(&[("a.b", Value::String("".into()))])),
+        )]);
         let m = Modifier::new(rule).unwrap();
         let inner = doc(&[("b", Value::Int32(1)), ("c", Value::Int32(2))]);
         let input = doc(&[("a", Value::Document(inner))]);
@@ -339,9 +351,18 @@ mod tests {
     #[test]
     fn combined_set_unset_inc() {
         let mut rule = Document::new();
-        rule.insert("$set", Value::Document(doc(&[("name", Value::String("updated".into()))])));
-        rule.insert("$unset", Value::Document(doc(&[("temp", Value::String("".into()))])));
-        rule.insert("$inc", Value::Document(doc(&[("version", Value::Int32(1))])));
+        rule.insert(
+            "$set",
+            Value::Document(doc(&[("name", Value::String("updated".into()))])),
+        );
+        rule.insert(
+            "$unset",
+            Value::Document(doc(&[("temp", Value::String("".into()))])),
+        );
+        rule.insert(
+            "$inc",
+            Value::Document(doc(&[("version", Value::Int32(1))])),
+        );
         let m = Modifier::new(rule).unwrap();
 
         let input = doc(&[
@@ -363,7 +384,10 @@ mod tests {
 
     #[test]
     fn invalid_inc_non_numeric() {
-        let rule = doc(&[("$inc", Value::Document(doc(&[("x", Value::String("bad".into()))])))]);
+        let rule = doc(&[(
+            "$inc",
+            Value::Document(doc(&[("x", Value::String("bad".into()))])),
+        )]);
         assert!(Modifier::new(rule).is_err());
     }
 }

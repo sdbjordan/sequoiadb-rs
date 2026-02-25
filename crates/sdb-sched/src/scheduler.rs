@@ -1,5 +1,5 @@
-use sdb_common::Result;
 use crate::task::{Task, TaskId, TaskState};
+use sdb_common::Result;
 use std::collections::HashMap;
 
 /// Task scheduler — manages background tasks.

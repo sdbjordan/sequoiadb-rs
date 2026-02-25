@@ -54,8 +54,12 @@ mod tests {
     fn match_eq() {
         let m = Matcher::new(doc(&[("name", Value::String("alice".into()))])).unwrap();
         assert!(!m.is_match_all());
-        assert!(m.matches(&doc(&[("name", Value::String("alice".into()))])).unwrap());
-        assert!(!m.matches(&doc(&[("name", Value::String("bob".into()))])).unwrap());
+        assert!(m
+            .matches(&doc(&[("name", Value::String("alice".into()))]))
+            .unwrap());
+        assert!(!m
+            .matches(&doc(&[("name", Value::String("bob".into()))]))
+            .unwrap());
     }
 
     #[test]

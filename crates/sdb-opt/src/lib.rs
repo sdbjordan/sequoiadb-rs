@@ -1,7 +1,7 @@
-pub mod plan;
-pub mod optimizer;
 pub mod access_path;
+pub mod optimizer;
+pub mod plan;
 
-pub use plan::{QueryPlan, PlanNode, PlanType};
-pub use optimizer::Optimizer;
 pub use access_path::AccessPath;
+pub use optimizer::Optimizer;
+pub use plan::{PlanNode, PlanType, QueryPlan};

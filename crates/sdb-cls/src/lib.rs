@@ -1,9 +1,9 @@
-pub mod replication;
-pub mod shard;
 pub mod election;
+pub mod replication;
 pub mod service;
+pub mod shard;
 
-pub use replication::ReplicationAgent;
-pub use shard::ShardManager;
 pub use election::ElectionManager;
+pub use replication::ReplicationAgent;
 pub use service::ReplicationService;
+pub use shard::ShardManager;

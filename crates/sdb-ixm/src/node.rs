@@ -207,11 +207,7 @@ pub fn read_leaf_cell(data: &[u8], cell_off: u16) -> Result<(IndexKey, RecordId)
 
 /// Write a leaf cell. Returns the byte offset where the cell was written.
 /// Decrements free_end accordingly.
-pub fn write_leaf_cell(
-    data: &mut [u8],
-    key_bytes: &[u8],
-    rid: RecordId,
-) -> u16 {
+pub fn write_leaf_cell(data: &mut [u8], key_bytes: &[u8], rid: RecordId) -> u16 {
     let cell_size = 2 + key_bytes.len() + 8; // key_len + key + extent_id + offset
     let fe = free_end(data) as usize;
     let new_fe = fe - cell_size;
@@ -248,11 +244,7 @@ pub fn read_internal_cell(data: &[u8], cell_off: u16) -> Result<(u32, IndexKey)>
 }
 
 /// Write an internal cell. Returns the byte offset where the cell was written.
-pub fn write_internal_cell(
-    data: &mut [u8],
-    key_bytes: &[u8],
-    left_child: u32,
-) -> u16 {
+pub fn write_internal_cell(data: &mut [u8], key_bytes: &[u8], left_child: u32) -> u16 {
     let cell_size = 4 + 2 + key_bytes.len(); // left_child + key_len + key
     let fe = free_end(data) as usize;
     let new_fe = fe - cell_size;
@@ -373,7 +365,14 @@ mod tests {
         // Write a cell to consume space
         let key = IndexKey::new(vec![Value::Int32(1)]);
         let kb = key.encode();
-        let cell_off = write_leaf_cell(&mut page, &kb, RecordId { extent_id: 0, offset: 0 });
+        let cell_off = write_leaf_cell(
+            &mut page,
+            &kb,
+            RecordId {
+                extent_id: 0,
+                offset: 0,
+            },
+        );
         insert_cell_pointer(&mut page, 0, cell_off);
 
         let after = available_space(&page);

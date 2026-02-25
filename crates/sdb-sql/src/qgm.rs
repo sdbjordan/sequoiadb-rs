@@ -1,6 +1,6 @@
-use sdb_opt::QueryPlan;
-use sdb_common::Result;
 use crate::ast::SqlStatement;
+use sdb_common::Result;
+use sdb_opt::QueryPlan;
 
 /// Query Graph Model — converts SQL AST to query plans.
 pub struct QueryGraph;

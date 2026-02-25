@@ -1,7 +1,7 @@
+use crate::connection::Connection;
 use async_trait::async_trait;
 use sdb_common::Result;
 use sdb_msg::MsgHeader;
-use crate::connection::Connection;
 
 /// Trait for handling incoming messages.
 #[async_trait]

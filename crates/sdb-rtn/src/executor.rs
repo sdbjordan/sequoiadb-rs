@@ -1,7 +1,7 @@
+use crate::cursor::Cursor;
 use async_trait::async_trait;
 use sdb_common::Result;
 use sdb_opt::QueryPlan;
-use crate::cursor::Cursor;
 
 /// Query executor trait.
 #[async_trait]

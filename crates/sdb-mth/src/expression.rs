@@ -92,7 +92,7 @@ fn parse_field(path: &str, value: &Value) -> Result<MatchExpression> {
     match value {
         Value::Document(doc) => {
             // Check if this is an operator document (keys start with $)
-            let is_op_doc = doc.iter().next().map_or(false, |e| e.key.starts_with('$'));
+            let is_op_doc = doc.iter().next().is_some_and(|e| e.key.starts_with('$'));
             if is_op_doc {
                 parse_field_operators(path, doc)
             } else {
@@ -232,9 +232,7 @@ pub fn evaluate(expr: &MatchExpression, doc: &Document) -> Result<bool> {
             }
             Ok(true)
         }
-        MatchExpression::Not(inner) => {
-            Ok(!evaluate(inner, doc)?)
-        }
+        MatchExpression::Not(inner) => Ok(!evaluate(inner, doc)?),
         MatchExpression::Compare { path, op, value } => {
             let doc_val = resolve_path(doc, path);
             match doc_val {
@@ -314,7 +312,13 @@ mod tests {
     fn parse_implicit_eq() {
         let cond = doc(&[("age", Value::Int32(25))]);
         let expr = parse_condition(&cond).unwrap();
-        assert!(matches!(expr, MatchExpression::Compare { op: CompareOp::Eq, .. }));
+        assert!(matches!(
+            expr,
+            MatchExpression::Compare {
+                op: CompareOp::Eq,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -351,7 +355,10 @@ mod tests {
         let ops = doc(&[("$exists", Value::Boolean(true))]);
         let cond = doc(&[("name", Value::Document(ops))]);
         let expr = parse_condition(&cond).unwrap();
-        assert!(matches!(expr, MatchExpression::Exists { expected: true, .. }));
+        assert!(matches!(
+            expr,
+            MatchExpression::Exists { expected: true, .. }
+        ));
     }
 
     #[test]
@@ -496,7 +503,11 @@ mod tests {
 
         assert!(evaluate(&expr, &doc(&[("x", Value::Int32(1))])).unwrap());
         assert!(evaluate(&expr, &doc(&[("y", Value::Int32(2))])).unwrap());
-        assert!(!evaluate(&expr, &doc(&[("x", Value::Int32(2)), ("y", Value::Int32(1))])).unwrap());
+        assert!(!evaluate(
+            &expr,
+            &doc(&[("x", Value::Int32(2)), ("y", Value::Int32(1))])
+        )
+        .unwrap());
     }
 
     #[test]
@@ -529,7 +540,15 @@ mod tests {
         let cond = doc(&[("x", Value::Int32(1)), ("y", Value::Int32(2))]);
         let expr = parse_condition(&cond).unwrap();
 
-        assert!(evaluate(&expr, &doc(&[("x", Value::Int32(1)), ("y", Value::Int32(2))])).unwrap());
-        assert!(!evaluate(&expr, &doc(&[("x", Value::Int32(1)), ("y", Value::Int32(3))])).unwrap());
+        assert!(evaluate(
+            &expr,
+            &doc(&[("x", Value::Int32(1)), ("y", Value::Int32(2))])
+        )
+        .unwrap());
+        assert!(!evaluate(
+            &expr,
+            &doc(&[("x", Value::Int32(1)), ("y", Value::Int32(3))])
+        )
+        .unwrap());
     }
 }

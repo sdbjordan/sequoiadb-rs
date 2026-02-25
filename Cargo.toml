@@ -68,3 +68,4 @@ clap = { version = "4", features = ["derive"] }
 thiserror = "2"
 async-trait = "0.1"
 crossbeam = "0.8"
+proptest = "1"

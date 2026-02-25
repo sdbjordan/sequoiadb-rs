@@ -1,6 +1,6 @@
+use crate::decode::Decode;
 use crate::element::{Element, Value};
 use crate::encode::Encode;
-use crate::decode::Decode;
 use crate::error::BsonResult;
 
 /// A BSON document — an ordered list of key-value elements.

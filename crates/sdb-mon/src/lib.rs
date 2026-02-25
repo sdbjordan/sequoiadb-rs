@@ -1,5 +1,5 @@
-pub mod snapshot;
 pub mod metrics;
+pub mod snapshot;
 
-pub use snapshot::Snapshot;
 pub use metrics::Metrics;
+pub use snapshot::Snapshot;

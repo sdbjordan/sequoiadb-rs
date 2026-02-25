@@ -5,9 +5,9 @@ pub mod key;
 pub mod node;
 
 pub use btree::BTreeIndex;
-pub use key::{IndexKey, KeyRange};
-pub use definition::IndexDefinition;
 pub use cursor::IndexCursor;
+pub use definition::IndexDefinition;
+pub use key::{IndexKey, KeyRange};
 
 use sdb_common::{RecordId, Result};
 

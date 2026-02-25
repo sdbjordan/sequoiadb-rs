@@ -131,7 +131,13 @@ pub fn set_free_space(data: &mut [u8; PAGE_SIZE], v: u32) {
 // --- init / validate ---
 
 /// Initialize an extent page with default header values.
-pub fn init_extent(data: &mut [u8; PAGE_SIZE], mb_id_val: u16, logic_id_val: i32, prev: i32, next: i32) {
+pub fn init_extent(
+    data: &mut [u8; PAGE_SIZE],
+    mb_id_val: u16,
+    logic_id_val: i32,
+    prev: i32,
+    next: i32,
+) {
     // zero the header region
     data[..EXTENT_HEADER_SIZE].fill(0);
     // eye catcher
@@ -227,7 +233,10 @@ mod tests {
     #[test]
     fn validate_bad() {
         let page = [0u8; PAGE_SIZE];
-        assert_eq!(validate_extent(&page).unwrap_err(), SdbError::CorruptedRecord);
+        assert_eq!(
+            validate_extent(&page).unwrap_err(),
+            SdbError::CorruptedRecord
+        );
     }
 
     #[test]

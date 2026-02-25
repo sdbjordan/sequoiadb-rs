@@ -1,5 +1,5 @@
-use sdb_common::{CollectionSpaceId, GroupId, Result};
 use crate::metadata::{CollectionMeta, CollectionSpaceMeta, GroupMeta};
+use sdb_common::{CollectionSpaceId, GroupId, Result};
 use std::collections::HashMap;
 
 /// Manages cluster-wide catalog metadata.
@@ -36,7 +36,11 @@ impl CatalogManager {
             .ok_or(sdb_common::SdbError::NodeNotFound)
     }
 
-    pub fn create_collection_space(&mut self, _id: CollectionSpaceId, meta: CollectionSpaceMeta) -> Result<()> {
+    pub fn create_collection_space(
+        &mut self,
+        _id: CollectionSpaceId,
+        meta: CollectionSpaceMeta,
+    ) -> Result<()> {
         if self.spaces.contains_key(&meta.name) {
             return Err(sdb_common::SdbError::CollectionSpaceAlreadyExists);
         }

@@ -101,8 +101,8 @@ pub fn read_cstring(buf: &[u8], offset: &mut usize) -> BsonResult<String> {
     loop {
         ensure_remaining(buf, *offset, 1)?;
         if buf[*offset] == 0 {
-            let s = std::str::from_utf8(&buf[start..*offset])
-                .map_err(|_| BsonError::InvalidUtf8)?;
+            let s =
+                std::str::from_utf8(&buf[start..*offset]).map_err(|_| BsonError::InvalidUtf8)?;
             *offset += 1; // skip null
             return Ok(s.to_owned());
         }

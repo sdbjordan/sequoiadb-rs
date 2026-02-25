@@ -1,6 +1,6 @@
+use crate::cursor::ClientCursor;
 use sdb_bson::Document;
 use sdb_common::Result;
-use crate::cursor::ClientCursor;
 
 /// Handle for a collection on the remote server.
 pub struct Collection {

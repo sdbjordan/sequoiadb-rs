@@ -3,7 +3,10 @@ use sdb_common::config::{NodeConfig, NodeRole};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
-#[command(name = "sequoiadb", about = "SequoiaDB-RS distributed document database")]
+#[command(
+    name = "sequoiadb",
+    about = "SequoiaDB-RS distributed document database"
+)]
 struct Cli {
     /// Node role: coord, catalog, or data
     #[arg(short, long, default_value = "data")]

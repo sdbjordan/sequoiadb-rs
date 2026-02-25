@@ -1,7 +1,7 @@
 pub mod router;
-pub mod session;
 pub mod service;
+pub mod session;
 
 pub use router::CoordRouter;
-pub use session::CoordSession;
 pub use service::CoordinatorService;
+pub use session::CoordSession;

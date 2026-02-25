@@ -1,6 +1,6 @@
+use crate::stage::Stage;
 use sdb_bson::Document;
 use sdb_common::Result;
-use crate::stage::Stage;
 
 /// Aggregation pipeline — a sequence of stages.
 pub struct Pipeline {

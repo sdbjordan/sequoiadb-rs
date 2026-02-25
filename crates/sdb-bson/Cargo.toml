@@ -8,3 +8,6 @@ description = "SequoiaDB-variant BSON encode/decode library"
 [dependencies]
 thiserror = { workspace = true }
 bytes = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

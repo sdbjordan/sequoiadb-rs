@@ -1,7 +1,7 @@
 pub mod log_record;
-pub mod wal;
 pub mod transaction;
+pub mod wal;
 
-pub use log_record::{LogRecord, LogOp};
-pub use wal::WriteAheadLog;
+pub use log_record::{LogOp, LogRecord};
 pub use transaction::TransactionManager;
+pub use wal::WriteAheadLog;

@@ -1,5 +1,5 @@
-pub mod task;
 pub mod scheduler;
+pub mod task;
 
-pub use task::{Task, TaskId, TaskState};
 pub use scheduler::Scheduler;
+pub use task::{Task, TaskId, TaskState};

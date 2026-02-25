@@ -1,6 +1,6 @@
-use sdb_bson::*;
 use sdb_bson::element::Value;
 use sdb_bson::types::ObjectId;
+use sdb_bson::*;
 
 fn roundtrip(doc: &Document) -> Document {
     let bytes = doc.to_bytes().unwrap();
@@ -19,11 +19,11 @@ fn empty_document() {
 #[test]
 fn single_double() {
     let doc = DocumentBuilder::new()
-        .append_double("pi", 3.14159)
+        .append_double("pi", std::f64::consts::PI)
         .build();
     let rt = roundtrip(&doc);
     match rt.get("pi").unwrap() {
-        Value::Double(v) => assert!((*v - 3.14159).abs() < 1e-10),
+        Value::Double(v) => assert!((*v - std::f64::consts::PI).abs() < 1e-10),
         _ => panic!("expected Double"),
     }
 }
@@ -52,9 +52,7 @@ fn single_i32() {
 
 #[test]
 fn single_i64() {
-    let doc = DocumentBuilder::new()
-        .append_i64("big", i64::MAX)
-        .build();
+    let doc = DocumentBuilder::new().append_i64("big", i64::MAX).build();
     let rt = roundtrip(&doc);
     match rt.get("big").unwrap() {
         Value::Int64(v) => assert_eq!(*v, i64::MAX),
@@ -107,9 +105,7 @@ fn single_object_id() {
     let oid = ObjectId {
         bytes: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
     };
-    let doc = DocumentBuilder::new()
-        .append_object_id("_id", oid)
-        .build();
+    let doc = DocumentBuilder::new().append_object_id("_id", oid).build();
     let rt = roundtrip(&doc);
     match rt.get("_id").unwrap() {
         Value::ObjectId(o) => assert_eq!(o.bytes, oid.bytes),
@@ -239,11 +235,11 @@ fn known_bytes_empty_doc() {
 fn known_bytes_int32() {
     // { "x": 1 }
     let bytes = vec![
-        12, 0, 0, 0, // doc length
-        16,           // type Int32
-        b'x', 0,     // key
-        1, 0, 0, 0,  // value
-        0,            // EOO
+        12, 0, 0, 0,  // doc length
+        16, // type Int32
+        b'x', 0, // key
+        1, 0, 0, 0, // value
+        0, // EOO
     ];
     let doc = Document::from_bytes(&bytes).unwrap();
     assert_eq!(doc.len(), 1);
@@ -269,11 +265,6 @@ fn error_bad_length() {
 
 #[test]
 fn error_unknown_type() {
-    let bytes = vec![
-        8, 0, 0, 0,
-        99,
-        b'x', 0,
-        0,
-    ];
+    let bytes = vec![8, 0, 0, 0, 99, b'x', 0, 0];
     assert!(Document::from_bytes(&bytes).is_err());
 }

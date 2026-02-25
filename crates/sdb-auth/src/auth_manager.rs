@@ -1,6 +1,6 @@
-use sdb_common::Result;
-use crate::user::User;
 use crate::role::{Permission, Resource, Role};
+use crate::user::User;
+use sdb_common::Result;
 
 /// Authentication and authorization manager.
 pub struct AuthManager {
@@ -21,7 +21,12 @@ impl AuthManager {
         Err(sdb_common::SdbError::AuthFailed)
     }
 
-    pub fn authorize(&self, _username: &str, _perm: Permission, _resource: &Resource) -> Result<()> {
+    pub fn authorize(
+        &self,
+        _username: &str,
+        _perm: Permission,
+        _resource: &Resource,
+    ) -> Result<()> {
         // Stub
         Err(sdb_common::SdbError::PermissionDenied)
     }

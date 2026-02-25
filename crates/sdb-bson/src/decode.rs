@@ -34,8 +34,7 @@ fn decode_document(buf: &[u8], offset: &mut usize) -> BsonResult<crate::Document
             // EOO
             break;
         }
-        let bson_type = BsonType::from_u8(tag)
-            .ok_or(BsonError::UnknownType(tag))?;
+        let bson_type = BsonType::from_u8(tag).ok_or(BsonError::UnknownType(tag))?;
         let key = raw::read_cstring(buf, offset)?;
         let value = decode_value(buf, offset, bson_type)?;
         doc.insert(key, value);

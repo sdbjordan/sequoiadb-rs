@@ -1,16 +1,16 @@
-pub mod types;
-pub mod raw;
+pub mod builder;
+pub mod decode;
 pub mod document;
 pub mod element;
-pub mod builder;
 pub mod encode;
-pub mod decode;
 pub mod error;
+pub mod raw;
+pub mod types;
 
+pub use builder::DocumentBuilder;
+pub use decode::Decode;
 pub use document::Document;
 pub use element::{Element, Value};
-pub use builder::DocumentBuilder;
-pub use types::BsonType;
 pub use encode::Encode;
-pub use decode::Decode;
 pub use error::{BsonError, BsonResult};
+pub use types::BsonType;

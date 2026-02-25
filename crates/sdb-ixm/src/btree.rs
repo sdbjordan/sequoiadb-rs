@@ -72,8 +72,8 @@ impl BTreeIndex {
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
             match self.cmp_key_at(page_id, mid as u16, key)? {
-                Ordering::Less => lo = mid + 1,  // cell_key < search_key, go right
-                _ => hi = mid,                   // cell_key >= search_key, go left (lower bound)
+                Ordering::Less => lo = mid + 1, // cell_key < search_key, go right
+                _ => hi = mid,                  // cell_key >= search_key, go left (lower bound)
             }
         }
         Ok(lo)
@@ -481,9 +481,7 @@ impl BTreeIndex {
             // Check start bound
             if let Some(ref start_key) = range.start {
                 let cmp = cell_key.cmp_with_directions(start_key, &self.directions);
-                if cmp == Ordering::Less
-                    || (cmp == Ordering::Equal && !range.start_inclusive)
-                {
+                if cmp == Ordering::Less || (cmp == Ordering::Equal && !range.start_inclusive) {
                     cur_idx += 1;
                     continue;
                 }
@@ -492,9 +490,7 @@ impl BTreeIndex {
             // Check end bound
             if let Some(ref end_key) = range.end {
                 let cmp = cell_key.cmp_with_directions(end_key, &self.directions);
-                if cmp == Ordering::Greater
-                    || (cmp == Ordering::Equal && !range.end_inclusive)
-                {
+                if cmp == Ordering::Greater || (cmp == Ordering::Equal && !range.end_inclusive) {
                     break;
                 }
             }
@@ -747,7 +743,11 @@ mod tests {
             );
         }
         // Tree should have multiple pages
-        assert!(idx.pages.len() > 1, "expected multiple pages after {} inserts", n);
+        assert!(
+            idx.pages.len() > 1,
+            "expected multiple pages after {} inserts",
+            n
+        );
     }
 
     #[test]

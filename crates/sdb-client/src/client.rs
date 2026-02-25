@@ -1,6 +1,6 @@
-use sdb_common::Result;
 use crate::collection::Collection;
 use crate::options::ConnectOptions;
+use sdb_common::Result;
 
 /// SequoiaDB client — main entry point for the driver.
 pub struct Client {

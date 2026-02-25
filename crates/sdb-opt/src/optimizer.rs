@@ -1,6 +1,6 @@
+use crate::plan::{PlanNode, PlanType, QueryPlan};
 use sdb_bson::Document;
 use sdb_common::Result;
-use crate::plan::{QueryPlan, PlanNode, PlanType};
 
 /// Query optimizer — chooses the best execution plan.
 pub struct Optimizer;

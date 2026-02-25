@@ -1,5 +1,5 @@
-use sdb_common::Result;
 use crate::handler::MessageHandler;
+use sdb_common::Result;
 use std::sync::Arc;
 
 /// Network event loop — accepts connections and dispatches messages.

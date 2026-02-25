@@ -1,5 +1,5 @@
-use sdb_common::{Lsn, Result};
 use crate::log_record::LogRecord;
+use sdb_common::{Lsn, Result};
 
 /// Write-ahead log for crash recovery and replication.
 pub struct WriteAheadLog {

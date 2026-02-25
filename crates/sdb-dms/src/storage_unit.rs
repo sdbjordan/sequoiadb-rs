@@ -15,8 +15,8 @@ use crate::record::{self, FLAG_DELETED, FLAG_NORMAL, RECORD_HEADER_SIZE};
 
 struct Inner {
     pages: Vec<Page>,
-    first_extent: i32,  // page id of first extent, -1 = none
-    last_extent: i32,   // page id of last extent, -1 = none
+    first_extent: i32, // page id of first extent, -1 = none
+    last_extent: i32,  // page id of last extent, -1 = none
     extent_count: u32,
     delete_list: DeleteList,
     next_logic_id: i32,
@@ -153,9 +153,7 @@ impl Inner {
         }
 
         // 1. Try delete list reuse
-        if let Some((ext_id, off, slot_size)) =
-            self.delete_list.pop_fit(total_size, &self.pages)
-        {
+        if let Some((ext_id, off, slot_size)) = self.delete_list.pop_fit(total_size, &self.pages) {
             // Reuse the slot: write new record into it
             let page = &mut self.pages[ext_id as usize];
 
@@ -368,9 +366,7 @@ mod tests {
     use sdb_bson::{DocumentBuilder, Value};
 
     fn make_doc(key: &str, val: &str) -> Document {
-        DocumentBuilder::new()
-            .append_string(key, val)
-            .build()
+        DocumentBuilder::new().append_string(key, val).build()
     }
 
     fn make_large_doc(size: usize) -> Document {
@@ -401,10 +397,7 @@ mod tests {
 
         for (i, rid) in rids.iter().enumerate() {
             let doc = su.find(*rid).unwrap();
-            assert_eq!(
-                doc.get("i").unwrap(),
-                &Value::String(i.to_string())
-            );
+            assert_eq!(doc.get("i").unwrap(), &Value::String(i.to_string()));
         }
     }
 

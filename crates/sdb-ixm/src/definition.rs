@@ -1,5 +1,5 @@
-use sdb_bson::Document;
 use sdb_bson::element::Value;
+use sdb_bson::Document;
 
 use crate::key::IndexKey;
 
@@ -35,11 +35,7 @@ impl IndexDefinition {
         let fields: Vec<Value> = self
             .key_pattern
             .iter()
-            .map(|elem| {
-                doc.get(&elem.key)
-                    .cloned()
-                    .unwrap_or(Value::Null)
-            })
+            .map(|elem| doc.get(&elem.key).cloned().unwrap_or(Value::Null))
             .collect();
         IndexKey::new(fields)
     }

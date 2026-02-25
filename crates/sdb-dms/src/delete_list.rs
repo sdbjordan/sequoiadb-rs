@@ -49,12 +49,7 @@ impl DeleteList {
 
         // Update the deleted record's chain pointers to the old head
         let page = &mut pages[ext_id as usize];
-        record::write_deleted_record(
-            &mut page.data,
-            offset as usize,
-            old_ext,
-            old_off,
-        );
+        record::write_deleted_record(&mut page.data, offset as usize, old_ext, old_off);
         page.dirty = true;
 
         // This slot is now the new head
@@ -150,14 +145,7 @@ mod tests {
 
         // Put a 256-byte slot in bucket 2
         let off = EXTENT_HEADER_SIZE as u32;
-        rec::write_record_header(
-            &mut pages[0].data,
-            off as usize,
-            FLAG_NORMAL,
-            256,
-            -1,
-            -1,
-        );
+        rec::write_record_header(&mut pages[0].data, off as usize, FLAG_NORMAL, 256, -1, -1);
         dl.push(256, 0, off, &mut pages);
 
         // Request 100 bytes — bucket 1 (≤128) is empty, should find in bucket 2

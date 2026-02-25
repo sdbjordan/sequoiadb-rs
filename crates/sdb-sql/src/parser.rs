@@ -1,5 +1,5 @@
-use sdb_common::Result;
 use crate::ast::SqlStatement;
+use sdb_common::Result;
 
 /// SQL parser — converts SQL text to AST.
 pub struct SqlParser;

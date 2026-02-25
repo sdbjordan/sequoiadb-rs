@@ -53,8 +53,10 @@ fn type_order(v: &Value) -> u8 {
 fn both_numeric(a: &Value, b: &Value) -> bool {
     matches!(
         (a, b),
-        (Value::Int32(_) | Value::Int64(_) | Value::Double(_),
-         Value::Int32(_) | Value::Int64(_) | Value::Double(_))
+        (
+            Value::Int32(_) | Value::Int64(_) | Value::Double(_),
+            Value::Int32(_) | Value::Int64(_) | Value::Double(_)
+        )
     )
 }
 
@@ -113,7 +115,10 @@ mod tests {
             .append_string("name", "alice")
             .build();
         assert_eq!(resolve_path(&doc, "age"), Some(&Value::Int32(25)));
-        assert_eq!(resolve_path(&doc, "name"), Some(&Value::String("alice".into())));
+        assert_eq!(
+            resolve_path(&doc, "name"),
+            Some(&Value::String("alice".into()))
+        );
         assert_eq!(resolve_path(&doc, "missing"), None);
     }
 
@@ -129,8 +134,14 @@ mod tests {
 
     #[test]
     fn compare_same_type() {
-        assert_eq!(compare_values(&Value::Int32(1), &Value::Int32(2)), Ordering::Less);
-        assert_eq!(compare_values(&Value::Int32(5), &Value::Int32(5)), Ordering::Equal);
+        assert_eq!(
+            compare_values(&Value::Int32(1), &Value::Int32(2)),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_values(&Value::Int32(5), &Value::Int32(5)),
+            Ordering::Equal
+        );
         assert_eq!(
             compare_values(&Value::String("a".into()), &Value::String("b".into())),
             Ordering::Less
@@ -139,15 +150,27 @@ mod tests {
 
     #[test]
     fn compare_numeric_cross_type() {
-        assert_eq!(compare_values(&Value::Int32(1), &Value::Int64(2)), Ordering::Less);
-        assert_eq!(compare_values(&Value::Int32(5), &Value::Double(5.0)), Ordering::Equal);
-        assert_eq!(compare_values(&Value::Double(1.5), &Value::Int32(2)), Ordering::Less);
+        assert_eq!(
+            compare_values(&Value::Int32(1), &Value::Int64(2)),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_values(&Value::Int32(5), &Value::Double(5.0)),
+            Ordering::Equal
+        );
+        assert_eq!(
+            compare_values(&Value::Double(1.5), &Value::Int32(2)),
+            Ordering::Less
+        );
     }
 
     #[test]
     fn compare_different_type_groups() {
         // Null < Number
-        assert_eq!(compare_values(&Value::Null, &Value::Int32(1)), Ordering::Less);
+        assert_eq!(
+            compare_values(&Value::Null, &Value::Int32(1)),
+            Ordering::Less
+        );
         // Number < String
         assert_eq!(
             compare_values(&Value::Int32(999), &Value::String("a".into())),
@@ -155,7 +178,10 @@ mod tests {
         );
         // MinKey < everything < MaxKey
         assert_eq!(compare_values(&Value::MinKey, &Value::Null), Ordering::Less);
-        assert_eq!(compare_values(&Value::Int32(0), &Value::MaxKey), Ordering::Less);
+        assert_eq!(
+            compare_values(&Value::Int32(0), &Value::MaxKey),
+            Ordering::Less
+        );
     }
 
     #[test]
