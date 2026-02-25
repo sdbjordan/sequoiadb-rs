@@ -1,6 +1,12 @@
+use std::sync::{Arc, RwLock};
+
 use clap::Parser;
 use sdb_common::config::{NodeConfig, NodeRole};
 use tracing_subscriber::EnvFilter;
+
+mod handler;
+
+use handler::DataNodeHandler;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -85,8 +91,14 @@ async fn start_catalog(config: &NodeConfig) {
 
 async fn start_data(config: &NodeConfig) {
     tracing::info!(port = config.port, "Starting data node");
-    // Stub: initialize data node components
-    let _wal = sdb_dps::WriteAheadLog::open(&config.db_path).expect("Failed to open WAL");
-    let _scheduler = sdb_sched::Scheduler::new();
-    tracing::info!("Data node ready");
+
+    let catalog = Arc::new(RwLock::new(sdb_cat::CatalogManager::new()));
+    let handler = Arc::new(DataNodeHandler::new(catalog));
+
+    let mut frame = sdb_net::NetFrame::new(format!("{}:{}", config.host, config.port));
+    frame.set_handler(handler);
+
+    if let Err(e) = frame.run().await {
+        tracing::error!("Data node error: {}", e);
+    }
 }
