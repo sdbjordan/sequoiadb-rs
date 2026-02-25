@@ -1,4 +1,5 @@
 pub mod types;
+pub mod raw;
 pub mod document;
 pub mod element;
 pub mod builder;

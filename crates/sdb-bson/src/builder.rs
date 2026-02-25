@@ -74,6 +74,37 @@ impl DocumentBuilder {
         self
     }
 
+    pub fn append_regex(
+        mut self,
+        key: impl Into<String>,
+        pattern: impl Into<String>,
+        options: impl Into<String>,
+    ) -> Self {
+        self.doc.insert(
+            key,
+            Value::Regex {
+                pattern: pattern.into(),
+                options: options.into(),
+            },
+        );
+        self
+    }
+
+    pub fn append_decimal(mut self, key: impl Into<String>, raw_bytes: Vec<u8>) -> Self {
+        self.doc.insert(key, Value::Decimal(raw_bytes));
+        self
+    }
+
+    pub fn append_min_key(mut self, key: impl Into<String>) -> Self {
+        self.doc.insert(key, Value::MinKey);
+        self
+    }
+
+    pub fn append_max_key(mut self, key: impl Into<String>) -> Self {
+        self.doc.insert(key, Value::MaxKey);
+        self
+    }
+
     pub fn build(self) -> Document {
         self.doc
     }

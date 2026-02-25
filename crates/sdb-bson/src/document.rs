@@ -1,4 +1,7 @@
 use crate::element::{Element, Value};
+use crate::encode::Encode;
+use crate::decode::Decode;
+use crate::error::BsonResult;
 
 /// A BSON document — an ordered list of key-value elements.
 #[derive(Debug, Clone, Default)]
@@ -42,5 +45,17 @@ impl Document {
     /// Iterate over elements.
     pub fn iter(&self) -> impl Iterator<Item = &Element> {
         self.elements.iter()
+    }
+
+    /// Encode this document to BSON bytes.
+    pub fn to_bytes(&self) -> BsonResult<Vec<u8>> {
+        let mut buf = Vec::new();
+        self.encode(&mut buf)?;
+        Ok(buf)
+    }
+
+    /// Decode a document from BSON bytes.
+    pub fn from_bytes(buf: &[u8]) -> BsonResult<Self> {
+        Self::decode(buf)
     }
 }

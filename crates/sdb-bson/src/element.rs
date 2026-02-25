@@ -23,6 +23,7 @@ pub enum Value {
     Int32(i32),
     Timestamp(u64),
     Int64(i64),
+    Decimal(Vec<u8>),
     MinKey,
     MaxKey,
 }
@@ -44,6 +45,7 @@ impl Value {
             Value::Int32(_) => BsonType::Int32,
             Value::Timestamp(_) => BsonType::Timestamp,
             Value::Int64(_) => BsonType::Int64,
+            Value::Decimal(_) => BsonType::Decimal,
             Value::MinKey => BsonType::MinKey,
             Value::MaxKey => BsonType::MaxKey,
         }

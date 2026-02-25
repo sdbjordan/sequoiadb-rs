@@ -17,6 +17,8 @@ pub enum BsonError {
     KeyNotFound(String),
     #[error("Document too large: {0} bytes")]
     DocumentTooLarge(usize),
+    #[error("Unknown BSON type tag: {0}")]
+    UnknownType(u8),
 }
 
 pub type BsonResult<T> = std::result::Result<T, BsonError>;

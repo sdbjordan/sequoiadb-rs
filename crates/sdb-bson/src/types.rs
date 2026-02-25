@@ -26,6 +26,36 @@ pub enum BsonType {
     MaxKey = 127,
 }
 
+impl BsonType {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::Eoo),
+            1 => Some(Self::Double),
+            2 => Some(Self::String),
+            3 => Some(Self::Object),
+            4 => Some(Self::Array),
+            5 => Some(Self::Binary),
+            6 => Some(Self::Undefined),
+            7 => Some(Self::ObjectId),
+            8 => Some(Self::Boolean),
+            9 => Some(Self::Date),
+            10 => Some(Self::Null),
+            11 => Some(Self::Regex),
+            12 => Some(Self::Ref),
+            13 => Some(Self::Code),
+            14 => Some(Self::Symbol),
+            15 => Some(Self::CodeWithScope),
+            16 => Some(Self::Int32),
+            17 => Some(Self::Timestamp),
+            18 => Some(Self::Int64),
+            100 => Some(Self::Decimal),
+            127 => Some(Self::MaxKey),
+            255 => Some(Self::MinKey),
+            _ => None,
+        }
+    }
+}
+
 /// 12-byte BSON ObjectId.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ObjectId {
