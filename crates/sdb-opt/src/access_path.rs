@@ -5,6 +5,8 @@ pub enum AccessPath {
     IndexScan {
         index_name: String,
         direction: ScanDirection,
+        selectivity: f64,
+        covers_sort: bool,
     },
 }
 

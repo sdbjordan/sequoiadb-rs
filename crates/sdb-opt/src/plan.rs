@@ -1,5 +1,7 @@
 use sdb_bson::Document;
 
+use crate::access_path::AccessPath;
+
 /// Type of query plan node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanType {
@@ -20,6 +22,8 @@ pub struct PlanNode {
     pub children: Vec<PlanNode>,
     pub estimated_cost: f64,
     pub estimated_rows: u64,
+    pub access_path: Option<AccessPath>,
+    pub sort_fields: Option<Document>,
 }
 
 /// Complete query plan for execution.
