@@ -16,7 +16,7 @@ pub enum LogOp {
 }
 
 /// A single log record in the write-ahead log.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LogRecord {
     pub lsn: Lsn,
     pub prev_lsn: Lsn,
