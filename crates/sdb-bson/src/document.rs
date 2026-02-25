@@ -4,7 +4,7 @@ use crate::decode::Decode;
 use crate::error::BsonResult;
 
 /// A BSON document — an ordered list of key-value elements.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Document {
     elements: Vec<Element>,
 }

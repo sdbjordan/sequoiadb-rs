@@ -8,7 +8,7 @@ pub mod decode;
 pub mod error;
 
 pub use document::Document;
-pub use element::Element;
+pub use element::{Element, Value};
 pub use builder::DocumentBuilder;
 pub use types::BsonType;
 pub use encode::Encode;

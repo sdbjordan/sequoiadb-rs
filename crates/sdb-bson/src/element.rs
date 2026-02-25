@@ -1,14 +1,14 @@
 use crate::types::{BsonType, ObjectId};
 
 /// A single BSON element (key-value pair within a document).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Element {
     pub key: String,
     pub value: Value,
 }
 
 /// BSON value variants.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Double(f64),
     String(String),
