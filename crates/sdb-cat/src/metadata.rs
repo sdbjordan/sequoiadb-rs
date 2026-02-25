@@ -10,6 +10,16 @@ pub struct CollectionSpaceMeta {
     pub collections: Vec<CollectionMeta>,
 }
 
+/// Metadata for an index on a collection.
+#[derive(Debug, Clone)]
+pub struct IndexMeta {
+    pub name: String,
+    pub key_pattern: Document,
+    pub unique: bool,
+    pub enforced: bool,
+    pub not_null: bool,
+}
+
 /// Metadata for a collection.
 #[derive(Debug, Clone)]
 pub struct CollectionMeta {
@@ -19,6 +29,7 @@ pub struct CollectionMeta {
     pub shard_key: Option<Document>,
     pub replicated: bool,
     pub groups: Vec<GroupId>,
+    pub indexes: Vec<IndexMeta>,
 }
 
 /// Metadata for a replica group.

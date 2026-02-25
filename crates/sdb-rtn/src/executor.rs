@@ -1,6 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use sdb_bson::{Document, Value};
@@ -16,7 +16,7 @@ use crate::cursor::Cursor;
 /// Bundles storage + indexes for a collection.
 pub struct CollectionHandle {
     pub storage: Arc<StorageUnit>,
-    pub indexes: Vec<BTreeIndex>,
+    pub indexes: Vec<Arc<RwLock<BTreeIndex>>>,
 }
 
 /// Query executor trait.
@@ -71,11 +71,12 @@ impl DefaultExecutor {
                     Some(AccessPath::IndexScan { index_name, .. }) => index_name,
                     _ => return Err(SdbError::InvalidArg),
                 };
-                let idx = handle
+                let idx_lock = handle
                     .indexes
                     .iter()
-                    .find(|i| i.definition.name == *index_name)
+                    .find(|i| i.read().unwrap().definition.name == *index_name)
                     .ok_or(SdbError::IndexNotFound)?;
+                let idx = idx_lock.read().unwrap();
                 let mut cursor = idx.scan(&KeyRange::all())?;
                 let mut docs = Vec::new();
                 while let Some(rid) = cursor.next() {
@@ -214,6 +215,7 @@ mod tests {
     use sdb_ixm::definition::IndexDefinition;
     use sdb_opt::access_path::{AccessPath, ScanDirection};
     use sdb_opt::plan::{PlanNode, PlanType, QueryPlan};
+    use std::sync::RwLock;
 
     fn make_storage_with_docs(docs: &[Document]) -> Arc<StorageUnit> {
         let su = Arc::new(StorageUnit::new(1, 1));
@@ -394,7 +396,7 @@ mod tests {
             "c".into(),
             CollectionHandle {
                 storage: su,
-                indexes: vec![idx],
+                indexes: vec![Arc::new(RwLock::new(idx))],
             },
         );
 
@@ -601,7 +603,7 @@ mod tests {
             "c".into(),
             CollectionHandle {
                 storage: su,
-                indexes: vec![idx],
+                indexes: vec![Arc::new(RwLock::new(idx))],
             },
         );
 

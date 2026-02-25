@@ -57,6 +57,8 @@ pub enum SdbError {
     CorruptedRecord,
     #[error("Index not found")]
     IndexNotFound,
+    #[error("Index already exists")]
+    IndexAlreadyExists,
     #[error("Task not found")]
     TaskNotFound,
 }
