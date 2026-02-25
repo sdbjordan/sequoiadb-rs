@@ -1,3 +1,5 @@
+pub mod compare;
+pub mod expression;
 pub mod matcher;
 pub mod modifier;
 
