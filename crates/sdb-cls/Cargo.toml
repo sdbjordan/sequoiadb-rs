@@ -1,0 +1,19 @@
+[package]
+name = "sdb-cls"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Cluster replication and sharding"
+
+[dependencies]
+sdb-bson = { workspace = true }
+sdb-common = { workspace = true }
+sdb-net = { workspace = true }
+sdb-msg = { workspace = true }
+sdb-dms = { workspace = true }
+sdb-dps = { workspace = true }
+sdb-rtn = { workspace = true }
+sdb-cat = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }

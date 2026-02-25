@@ -1,0 +1,10 @@
+[package]
+name = "sdb-auth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Authentication and RBAC"
+
+[dependencies]
+sdb-bson = { workspace = true }
+sdb-common = { workspace = true }

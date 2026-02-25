@@ -1,0 +1,70 @@
+[workspace]
+members = [
+    "crates/sdb-bson",
+    "crates/sdb-common",
+    "crates/sdb-msg",
+    "crates/sdb-net",
+    "crates/sdb-dms",
+    "crates/sdb-ixm",
+    "crates/sdb-dps",
+    "crates/sdb-mth",
+    "crates/sdb-opt",
+    "crates/sdb-rtn",
+    "crates/sdb-cat",
+    "crates/sdb-cls",
+    "crates/sdb-coord",
+    "crates/sdb-auth",
+    "crates/sdb-aggr",
+    "crates/sdb-sql",
+    "crates/sdb-mon",
+    "crates/sdb-sched",
+    "crates/sdb-client",
+    "crates/sdb-server",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0"
+repository = "https://github.com/sdbjordan/sequoiadb-rs"
+
+[workspace.dependencies]
+# Layer 0
+sdb-bson = { path = "crates/sdb-bson" }
+sdb-common = { path = "crates/sdb-common" }
+# Layer 1
+sdb-msg = { path = "crates/sdb-msg" }
+# Layer 2
+sdb-net = { path = "crates/sdb-net" }
+sdb-dms = { path = "crates/sdb-dms" }
+sdb-dps = { path = "crates/sdb-dps" }
+sdb-ixm = { path = "crates/sdb-ixm" }
+sdb-mth = { path = "crates/sdb-mth" }
+# Layer 3
+sdb-opt = { path = "crates/sdb-opt" }
+sdb-rtn = { path = "crates/sdb-rtn" }
+sdb-auth = { path = "crates/sdb-auth" }
+sdb-aggr = { path = "crates/sdb-aggr" }
+sdb-sql = { path = "crates/sdb-sql" }
+sdb-mon = { path = "crates/sdb-mon" }
+sdb-sched = { path = "crates/sdb-sched" }
+# Layer 4
+sdb-cat = { path = "crates/sdb-cat" }
+sdb-cls = { path = "crates/sdb-cls" }
+sdb-coord = { path = "crates/sdb-coord" }
+# Layer 5
+sdb-client = { path = "crates/sdb-client" }
+sdb-server = { path = "crates/sdb-server" }
+
+# Third-party
+tokio = { version = "1", features = ["full"] }
+bytes = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+thiserror = "2"
+async-trait = "0.1"
+crossbeam = "0.8"

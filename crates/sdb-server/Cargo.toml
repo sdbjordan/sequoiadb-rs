@@ -1,0 +1,36 @@
+[package]
+name = "sdb-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Unified SequoiaDB-RS server binary"
+
+[[bin]]
+name = "sequoiadb"
+path = "src/main.rs"
+
+[dependencies]
+sdb-bson = { workspace = true }
+sdb-common = { workspace = true }
+sdb-msg = { workspace = true }
+sdb-net = { workspace = true }
+sdb-dms = { workspace = true }
+sdb-ixm = { workspace = true }
+sdb-dps = { workspace = true }
+sdb-mth = { workspace = true }
+sdb-opt = { workspace = true }
+sdb-rtn = { workspace = true }
+sdb-cat = { workspace = true }
+sdb-cls = { workspace = true }
+sdb-coord = { workspace = true }
+sdb-auth = { workspace = true }
+sdb-aggr = { workspace = true }
+sdb-sql = { workspace = true }
+sdb-mon = { workspace = true }
+sdb-sched = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }

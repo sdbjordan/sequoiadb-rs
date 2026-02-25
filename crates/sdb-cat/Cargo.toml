@@ -1,0 +1,16 @@
+[package]
+name = "sdb-cat"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Catalog service"
+
+[dependencies]
+sdb-bson = { workspace = true }
+sdb-common = { workspace = true }
+sdb-net = { workspace = true }
+sdb-msg = { workspace = true }
+sdb-dms = { workspace = true }
+sdb-auth = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }

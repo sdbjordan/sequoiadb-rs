@@ -1,0 +1,10 @@
+[package]
+name = "sdb-mon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Monitoring and diagnostics"
+
+[dependencies]
+sdb-common = { workspace = true }
+tracing = { workspace = true }

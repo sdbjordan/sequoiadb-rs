@@ -1,0 +1,20 @@
+[package]
+name = "sdb-coord"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Coordinator node"
+
+[dependencies]
+sdb-bson = { workspace = true }
+sdb-common = { workspace = true }
+sdb-net = { workspace = true }
+sdb-msg = { workspace = true }
+sdb-rtn = { workspace = true }
+sdb-cat = { workspace = true }
+sdb-cls = { workspace = true }
+sdb-opt = { workspace = true }
+sdb-auth = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }

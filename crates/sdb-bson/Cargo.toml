@@ -1,0 +1,10 @@
+[package]
+name = "sdb-bson"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SequoiaDB-variant BSON encode/decode library"
+
+[dependencies]
+thiserror = { workspace = true }
+bytes = { workspace = true }

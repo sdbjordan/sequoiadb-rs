@@ -1,0 +1,12 @@
+[package]
+name = "sdb-common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared types, error codes, and configuration for SequoiaDB-RS"
+
+[dependencies]
+thiserror = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }

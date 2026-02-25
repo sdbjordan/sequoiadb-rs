@@ -1,0 +1,13 @@
+[package]
+name = "sdb-opt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Query optimizer"
+
+[dependencies]
+sdb-bson = { workspace = true }
+sdb-common = { workspace = true }
+sdb-mth = { workspace = true }
+sdb-dms = { workspace = true }
+sdb-ixm = { workspace = true }

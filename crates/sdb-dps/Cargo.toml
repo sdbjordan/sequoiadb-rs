@@ -1,0 +1,11 @@
+[package]
+name = "sdb-dps"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Write-ahead log and transaction management"
+
+[dependencies]
+sdb-bson = { workspace = true }
+sdb-common = { workspace = true }
+tracing = { workspace = true }

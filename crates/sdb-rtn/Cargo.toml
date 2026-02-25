@@ -1,0 +1,19 @@
+[package]
+name = "sdb-rtn"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Query execution runtime"
+
+[dependencies]
+sdb-bson = { workspace = true }
+sdb-common = { workspace = true }
+sdb-dms = { workspace = true }
+sdb-ixm = { workspace = true }
+sdb-dps = { workspace = true }
+sdb-mth = { workspace = true }
+sdb-opt = { workspace = true }
+sdb-net = { workspace = true }
+sdb-msg = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }

@@ -1,0 +1,11 @@
+[package]
+name = "sdb-msg"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Message formats and protocol definitions for SequoiaDB-RS"
+
+[dependencies]
+sdb-bson = { workspace = true }
+sdb-common = { workspace = true }
+bytes = { workspace = true }

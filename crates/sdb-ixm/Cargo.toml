@@ -1,0 +1,12 @@
+[package]
+name = "sdb-ixm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Index management: B-tree indexes"
+
+[dependencies]
+sdb-bson = { workspace = true }
+sdb-common = { workspace = true }
+sdb-dms = { workspace = true }
+tracing = { workspace = true }
