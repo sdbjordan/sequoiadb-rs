@@ -189,6 +189,14 @@ impl QueryGraph {
     }
 }
 
+impl QueryGraph {
+    /// Parse a simple WHERE clause string into a BSON condition document.
+    /// Public so the server can use it for SQL DML execution.
+    pub fn parse_where_to_bson(clause: &str) -> Result<Document> {
+        parse_where_to_bson(clause)
+    }
+}
+
 impl Default for QueryGraph {
     fn default() -> Self {
         Self::new()

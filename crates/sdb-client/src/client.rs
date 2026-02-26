@@ -249,6 +249,79 @@ impl Client {
         check_reply(&reply)
     }
 
+    // ── SQL ─────────────────────────────────────────────────────────
+
+    /// Execute a SQL statement and return result documents.
+    pub async fn exec_sql(&self, sql: &str) -> Result<Vec<Document>> {
+        let mut conn = self.conn.lock().await;
+        let rid = conn.next_id();
+
+        let mut cond = Document::new();
+        cond.insert("SQL", Value::String(sql.into()));
+
+        let bytes = MsgOpQuery::new(
+            rid, "$sql", Some(cond), None, None, None, 0, -1, 0,
+        ).encode();
+        let reply = conn.send_and_recv(&bytes).await?;
+        check_reply(&reply)?;
+        Ok(reply.docs)
+    }
+
+    // ── Auth ────────────────────────────────────────────────────────
+
+    /// Authenticate with the server.
+    pub async fn authenticate(&self, username: &str, password: &str) -> Result<()> {
+        let mut conn = self.conn.lock().await;
+        let rid = conn.next_id();
+
+        let mut cond = Document::new();
+        cond.insert("User", Value::String(username.into()));
+        cond.insert("Passwd", Value::String(password.into()));
+
+        let bytes = MsgOpQuery::new(
+            rid, "$authenticate", Some(cond), None, None, None, 0, -1, 0,
+        ).encode();
+        let reply = conn.send_and_recv(&bytes).await?;
+        check_reply(&reply)
+    }
+
+    /// Create a user on the server.
+    pub async fn create_user(
+        &self,
+        username: &str,
+        password: &str,
+        roles: Vec<String>,
+    ) -> Result<()> {
+        let mut conn = self.conn.lock().await;
+        let rid = conn.next_id();
+
+        let role_vals: Vec<Value> = roles.into_iter().map(Value::String).collect();
+        let mut cond = Document::new();
+        cond.insert("User", Value::String(username.into()));
+        cond.insert("Passwd", Value::String(password.into()));
+        cond.insert("Roles", Value::Array(role_vals));
+
+        let bytes = MsgOpQuery::new(
+            rid, "$create user", Some(cond), None, None, None, 0, -1, 0,
+        ).encode();
+        let reply = conn.send_and_recv(&bytes).await?;
+        check_reply(&reply)
+    }
+
+    /// Drop a user from the server.
+    pub async fn drop_user(&self, username: &str) -> Result<()> {
+        let mut conn = self.conn.lock().await;
+        let rid = conn.next_id();
+
+        let mut cond = Document::new();
+        cond.insert("User", Value::String(username.into()));
+
+        let bytes = MsgOpQuery::new(
+            rid, "$drop user", Some(cond), None, None, None, 0, -1, 0,
+        ).encode();
+        let reply = conn.send_and_recv(&bytes).await?;
+        check_reply(&reply)
+    }
 }
 
 /// Check a reply's flags; return Ok(()) on success, Err on server error.

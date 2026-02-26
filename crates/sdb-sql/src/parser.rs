@@ -99,7 +99,21 @@ fn is_word(tokens: &[Token], pos: usize, kw: &str) -> bool {
 
 fn read_identifier(tokens: &[Token], pos: &mut usize) -> Result<String> {
     match tokens.get(*pos) {
-        Some(Token::Word(w)) => { let s = w.clone(); *pos += 1; Ok(s) }
+        Some(Token::Word(w)) => {
+            let mut s = w.clone();
+            *pos += 1;
+            // Handle dotted identifiers (e.g., "cs.cl")
+            while matches!(tokens.get(*pos), Some(Token::Dot)) {
+                if let Some(Token::Word(w2)) = tokens.get(*pos + 1) {
+                    s.push('.');
+                    s.push_str(w2);
+                    *pos += 2;
+                } else {
+                    break;
+                }
+            }
+            Ok(s)
+        }
         _ => Err(SdbError::InvalidArg),
     }
 }

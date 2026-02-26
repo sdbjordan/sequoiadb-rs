@@ -4,8 +4,13 @@ use clap::Parser;
 use sdb_common::config::{NodeConfig, NodeRole};
 use tracing_subscriber::EnvFilter;
 
+mod coord_handler;
+mod cursor_manager;
+mod data_store;
 mod handler;
 
+use coord_handler::CoordNodeHandler;
+use data_store::DataStore;
 use handler::DataNodeHandler;
 
 #[derive(Parser, Debug)]
@@ -77,9 +82,17 @@ fn main() {
 
 async fn start_coord(config: &NodeConfig) {
     tracing::info!(port = config.port, "Starting coordinator node");
-    // Stub: initialize coordinator components
-    let _router = sdb_coord::CoordRouter::new();
+
+    // Create coord handler with 3 default data groups
+    let coord = Arc::new(CoordNodeHandler::new(&[1, 2, 3]));
+
+    let mut frame = sdb_net::NetFrame::new(format!("{}:{}", config.host, config.port));
+    frame.set_handler(coord);
+
     tracing::info!("Coordinator node ready");
+    if let Err(e) = frame.run().await {
+        tracing::error!("Coordinator node error: {}", e);
+    }
 }
 
 async fn start_catalog(config: &NodeConfig) {
@@ -92,8 +105,20 @@ async fn start_catalog(config: &NodeConfig) {
 async fn start_data(config: &NodeConfig) {
     tracing::info!(port = config.port, "Starting data node");
 
-    let catalog = Arc::new(RwLock::new(sdb_cat::CatalogManager::new()));
-    let handler = Arc::new(DataNodeHandler::new(catalog));
+    // Try to load persisted data
+    let data_store = DataStore::new(&config.db_path);
+    let catalog = match data_store.load() {
+        Ok(cat) => {
+            tracing::info!("Loaded persisted catalog from {}", config.db_path);
+            Arc::new(RwLock::new(cat))
+        }
+        Err(e) => {
+            tracing::warn!("Could not load catalog ({}), starting fresh", e);
+            Arc::new(RwLock::new(sdb_cat::CatalogManager::new()))
+        }
+    };
+
+    let handler = Arc::new(DataNodeHandler::new(catalog.clone()));
 
     let mut frame = sdb_net::NetFrame::new(format!("{}:{}", config.host, config.port));
     frame.set_handler(handler);

@@ -239,3 +239,198 @@ async fn error_nonexistent() {
     // Create CL without CS
     assert!(client.create_collection("nope", "cl").await.is_err());
 }
+
+// ── Auth tests ──────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn auth_create_user_and_authenticate() {
+    let port = start_test_server().await;
+    let client = test_client(port).await;
+
+    // Create user
+    client
+        .create_user("testuser", "pass123", vec!["admin".into()])
+        .await
+        .unwrap();
+
+    // Authenticate with correct creds
+    client.authenticate("testuser", "pass123").await.unwrap();
+
+    // Wrong password should fail
+    assert!(client.authenticate("testuser", "wrong").await.is_err());
+
+    // Drop user
+    client.drop_user("testuser").await.unwrap();
+
+    // Auth after drop should fail
+    assert!(client.authenticate("testuser", "pass123").await.is_err());
+}
+
+// ── Aggregate tests ─────────────────────────────────────────────────
+
+#[tokio::test]
+async fn aggregate_match_and_limit() {
+    let port = start_test_server().await;
+    let client = test_client(port).await;
+
+    client.create_collection_space("aggcs").await.unwrap();
+    client.create_collection("aggcs", "cl").await.unwrap();
+
+    let cl = client.get_collection("aggcs", "cl");
+
+    let docs: Vec<Document> = (0..10)
+        .map(|i| doc(&[("val", Value::Int32(i))]))
+        .collect();
+    cl.insert_many(docs).await.unwrap();
+
+    // Aggregate: $match val >= 5 → $limit 3
+    let pipeline = vec![
+        Value::Document(doc(&[(
+            "$match",
+            Value::Document(doc(&[("val", Value::Document(doc(&[("$gte", Value::Int32(5))])))])),
+        )])),
+        Value::Document(doc(&[("$limit", Value::Int32(3))])),
+    ];
+    let results = cl.aggregate(pipeline).await.unwrap();
+    assert_eq!(results.len(), 3);
+    // All should have val >= 5
+    for r in &results {
+        match r.get("val") {
+            Some(Value::Int32(v)) => assert!(*v >= 5),
+            _ => panic!("expected Int32 val"),
+        }
+    }
+}
+
+// ── SQL tests ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn sql_select() {
+    let port = start_test_server().await;
+    let client = test_client(port).await;
+
+    client.create_collection_space("sqlcs").await.unwrap();
+    client.create_collection("sqlcs", "cl").await.unwrap();
+
+    let cl = client.get_collection("sqlcs", "cl");
+    cl.insert_many(vec![
+        doc(&[("name", Value::String("alice".into())), ("age", Value::Int32(30))]),
+        doc(&[("name", Value::String("bob".into())), ("age", Value::Int32(25))]),
+    ])
+    .await
+    .unwrap();
+
+    let results = client.exec_sql("SELECT * FROM sqlcs.cl").await.unwrap();
+    assert_eq!(results.len(), 2);
+}
+
+// ── Server-side count tests ─────────────────────────────────────────
+
+#[tokio::test]
+async fn server_side_count() {
+    let port = start_test_server().await;
+    let client = test_client(port).await;
+
+    client.create_collection_space("cntcs").await.unwrap();
+    client.create_collection("cntcs", "cl").await.unwrap();
+
+    let cl = client.get_collection("cntcs", "cl");
+    let docs: Vec<Document> = (0..8)
+        .map(|i| doc(&[("val", Value::Int32(i))]))
+        .collect();
+    cl.insert_many(docs).await.unwrap();
+
+    // Count all
+    let count = cl.count(None).await.unwrap();
+    assert_eq!(count, 8);
+
+    // Count with condition
+    let cond = doc(&[("val", Value::Document(doc(&[("$gte", Value::Int32(5))])))]);
+    let count = cl.count(Some(cond)).await.unwrap();
+    assert_eq!(count, 3); // val=5,6,7
+}
+
+// ── GetMore cursor tests ────────────────────────────────────────────
+
+#[tokio::test]
+async fn get_more_cursor_collect_all_async() {
+    let port = start_test_server().await;
+    let client = test_client(port).await;
+
+    client.create_collection_space("gmcs").await.unwrap();
+    client.create_collection("gmcs", "cl").await.unwrap();
+
+    let cl = client.get_collection("gmcs", "cl");
+
+    // Insert 250 docs (> batch size of 100)
+    let docs: Vec<Document> = (0..250)
+        .map(|i| doc(&[("i", Value::Int32(i))]))
+        .collect();
+    cl.insert_many(docs).await.unwrap();
+
+    // collect_all_async should fetch all batches transparently
+    let mut cursor = cl.query(None).await.unwrap();
+    let all = cursor.collect_all_async().await.unwrap();
+    assert_eq!(all.len(), 250, "should collect all 250 docs");
+}
+
+#[tokio::test]
+async fn get_more_cursor_manual_fetch() {
+    let port = start_test_server().await;
+    let client = test_client(port).await;
+
+    client.create_collection_space("gm2cs").await.unwrap();
+    client.create_collection("gm2cs", "cl").await.unwrap();
+
+    let cl = client.get_collection("gm2cs", "cl");
+
+    // Insert 150 docs
+    let docs: Vec<Document> = (0..150)
+        .map(|i| doc(&[("i", Value::Int32(i))]))
+        .collect();
+    cl.insert_many(docs).await.unwrap();
+
+    let mut cursor = cl.query(None).await.unwrap();
+
+    // First batch: 100 docs in buffer
+    let mut count = 0;
+    while let Some(_) = cursor.next() {
+        count += 1;
+    }
+    assert_eq!(count, 100, "first batch should be 100");
+    assert!(cursor.has_more(), "should have more batches");
+
+    // Fetch next batch
+    let got_more = cursor.fetch_more().await.unwrap();
+    assert!(got_more, "should have fetched more docs");
+
+    let mut count2 = 0;
+    while let Some(_) = cursor.next() {
+        count2 += 1;
+    }
+    assert_eq!(count2, 50, "second batch should be 50");
+    assert!(!cursor.has_more(), "should be exhausted (context_id == -1)");
+}
+
+#[tokio::test]
+async fn cursor_close_async_kills_server_cursor() {
+    let port = start_test_server().await;
+    let client = test_client(port).await;
+
+    client.create_collection_space("clcs").await.unwrap();
+    client.create_collection("clcs", "cl").await.unwrap();
+
+    let cl = client.get_collection("clcs", "cl");
+    let docs: Vec<Document> = (0..200)
+        .map(|i| doc(&[("i", Value::Int32(i))]))
+        .collect();
+    cl.insert_many(docs).await.unwrap();
+
+    let mut cursor = cl.query(None).await.unwrap();
+    assert!(cursor.has_more());
+
+    // Close the cursor — sends KillContext to server
+    cursor.close_async().await.unwrap();
+    assert!(!cursor.has_more());
+    assert!(cursor.next().is_none());
+}
