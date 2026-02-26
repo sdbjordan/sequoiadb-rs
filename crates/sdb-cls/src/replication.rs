@@ -13,6 +13,10 @@ pub struct ReplicaStatus {
     pub node: NodeAddress,
     pub synced_lsn: Lsn,
     pub is_alive: bool,
+    /// Consecutive failure count for exponential backoff.
+    pub fail_count: u32,
+    /// When the next reconnect attempt is allowed.
+    pub next_retry: Option<std::time::Instant>,
 }
 
 /// Replication agent — handles log shipping to replicas.
@@ -39,6 +43,8 @@ impl ReplicationAgent {
             node,
             synced_lsn: 0,
             is_alive: true,
+            fail_count: 0,
+            next_retry: None,
         });
     }
 
@@ -104,6 +110,49 @@ impl ReplicationAgent {
         let total = self.replicas.len() + 1; // include self
         let synced = self.count_synced(lsn) + 1; // self is always synced
         synced > total / 2
+    }
+
+    /// Record a replication failure for a peer (exponential backoff).
+    pub fn record_failure(&mut self, peer_id: u16) {
+        if let Some(replica) = self.replicas.get_mut(&peer_id) {
+            replica.fail_count = replica.fail_count.saturating_add(1);
+            // Backoff: 1s, 2s, 4s, 8s, max 30s
+            let backoff_secs = std::cmp::min(30, 1u64 << replica.fail_count.min(5));
+            replica.next_retry = Some(
+                std::time::Instant::now() + std::time::Duration::from_secs(backoff_secs),
+            );
+            replica.is_alive = false;
+        }
+    }
+
+    /// Record a successful replication to a peer (reset backoff).
+    pub fn record_success(&mut self, peer_id: u16) {
+        if let Some(replica) = self.replicas.get_mut(&peer_id) {
+            replica.fail_count = 0;
+            replica.next_retry = None;
+            replica.is_alive = true;
+        }
+    }
+
+    /// Check if a peer is ready for a retry attempt.
+    pub fn is_retry_ready(&self, peer_id: u16) -> bool {
+        match self.replicas.get(&peer_id) {
+            Some(replica) => match replica.next_retry {
+                Some(t) => std::time::Instant::now() >= t,
+                None => true, // no backoff = always ready
+            },
+            None => false,
+        }
+    }
+
+    /// Attempt to reconnect to failed peers and catch up their WAL.
+    /// Called periodically from the election loop.
+    pub fn peers_needing_catchup(&self) -> Vec<(u16, Lsn)> {
+        self.replicas
+            .iter()
+            .filter(|(_, r)| !r.is_alive && self.is_retry_ready(r.node.node_id))
+            .map(|(id, r)| (*id, r.synced_lsn))
+            .collect()
     }
 
     /// Push WAL frames to a specific peer via TCP.
@@ -218,7 +267,7 @@ impl ReplicationAgent {
             .filter(|(id, _)| {
                 self.replicas
                     .get(id)
-                    .map(|r| r.is_alive)
+                    .map(|r| r.is_alive || self.is_retry_ready(**id))
                     .unwrap_or(false)
             })
             .map(|(id, addr)| (*id, addr.clone()))
@@ -328,15 +377,24 @@ impl ReplicationAgent {
         match results {
             Ok(join_results) => {
                 for join_result in join_results {
-                    if let Ok((peer_id, Ok(lsn))) = join_result {
-                        if let Some(replica) = self.replicas.get_mut(&peer_id) {
-                            replica.synced_lsn = lsn;
+                    match join_result {
+                        Ok((peer_id, Ok(lsn))) => {
+                            if let Some(replica) = self.replicas.get_mut(&peer_id) {
+                                replica.synced_lsn = lsn;
+                            }
+                            self.record_success(peer_id);
+                        }
+                        Ok((peer_id, Err(_))) => {
+                            self.record_failure(peer_id);
+                        }
+                        Err(_) => {
+                            // JoinError — task panicked, nothing to do
                         }
                     }
                 }
             }
             Err(_) => {
-                // Timeout — some peers may not have acked
+                // Timeout — mark all peers in this batch as potentially failed
                 tracing::warn!("Replication timeout, some peers may be behind");
             }
         }

@@ -139,10 +139,19 @@ async fn start_coord(config: &NodeConfig) {
             .collect()
     };
 
-    let coord = Arc::new(CoordNodeHandler::new(data_nodes));
+    let config_path = format!("{}/coord_state.json", config.db_path);
+    let coord = Arc::new(CoordNodeHandler::new_with_persistence(data_nodes, config_path));
 
     let mut frame = sdb_net::NetFrame::new(format!("{}:{}", config.host, config.port));
+    let shutdown_tx = frame.shutdown_sender();
     frame.set_handler(coord);
+
+    // Install SIGTERM/SIGINT handler
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("Received shutdown signal (coord)");
+        let _ = shutdown_tx.send(true);
+    });
 
     tracing::info!("Coordinator node ready");
     if let Err(e) = frame.run().await {
@@ -194,6 +203,7 @@ async fn start_data(config: &NodeConfig) {
     };
 
     let wal = Arc::new(Mutex::new(wal));
+    let wal_for_shutdown = wal.clone();
 
     let handler: Arc<DataNodeHandler> = if config.repl_enabled && !config.repl_peers.is_empty() {
         let local_node = NodeAddress {
@@ -244,7 +254,23 @@ async fn start_data(config: &NodeConfig) {
     };
 
     let mut frame = sdb_net::NetFrame::new(format!("{}:{}", config.host, config.port));
+    let shutdown_tx = frame.shutdown_sender();
     frame.set_handler(handler);
+
+    // Install SIGTERM/SIGINT handler — flush WAL before exit
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("Received shutdown signal (data node)");
+        // Flush WAL before shutdown
+        if let Ok(mut w) = wal_for_shutdown.lock() {
+            if let Err(e) = w.flush() {
+                tracing::error!("WAL flush on shutdown failed: {}", e);
+            } else {
+                tracing::info!("WAL flushed successfully on shutdown");
+            }
+        }
+        let _ = shutdown_tx.send(true);
+    });
 
     if let Err(e) = frame.run().await {
         tracing::error!("Data node error: {}", e);

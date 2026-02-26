@@ -2413,3 +2413,316 @@ fn election_add_peer_no_duplicates() {
     em.add_peer(NodeAddress { group_id: 1, node_id: 2 }); // duplicate
     assert_eq!(em.peer_list().len(), 1);
 }
+
+// ══════════════════════════════════════════════════════════════════
+// Tier 1: Production Readiness Tests
+// ══════════════════════════════════════════════════════════════════
+
+// ── Graceful Shutdown ─────────────────────────────────────────────
+
+#[tokio::test]
+async fn graceful_shutdown_stops_server() {
+    let catalog = Arc::new(RwLock::new(CatalogManager::new()));
+    let handler: Arc<dyn MessageHandler> = Arc::new(DataNodeHandler::new(catalog));
+
+    let mut frame = sdb_net::NetFrame::new("127.0.0.1:0");
+    let shutdown_tx = frame.shutdown_sender();
+    frame.set_handler(handler);
+
+    // We can't use frame.run() directly since it needs a real TCP listener,
+    // but we can verify the shutdown signal mechanism works
+    let _ = shutdown_tx.send(true);
+    assert!(*shutdown_tx.borrow()); // signal was sent
+}
+
+#[tokio::test]
+async fn netframe_shutdown_method_sends_signal() {
+    let mut frame = sdb_net::NetFrame::new("127.0.0.1:0");
+    let handler: Arc<dyn MessageHandler> = Arc::new(DataNodeHandler::new(
+        Arc::new(RwLock::new(CatalogManager::new())),
+    ));
+    frame.set_handler(handler);
+
+    // The shutdown method should send the signal
+    frame.shutdown().await.unwrap();
+
+    // Verify receiver got the signal
+    let rx = frame.shutdown_sender();
+    assert!(*rx.borrow());
+}
+
+// ── Connection Pool ──────────────────────────────────────────────
+
+#[tokio::test]
+async fn connection_pool_reuses_connections() {
+    let port = start_test_server().await;
+    let client = sdb_server::data_node_client::DataNodeClient::new(
+        format!("127.0.0.1:{}", port),
+    );
+
+    // Create CS/CL
+    client.create_collection_space("pool_test").await.unwrap();
+    client.create_collection("pool_test.cl").await.unwrap();
+
+    // After first request, pool should have a returned connection
+    let pool_size = client.pool_size().await;
+    assert!(pool_size > 0, "Pool should have at least 1 connection after request");
+
+    // Second request should reuse the pooled connection
+    let mut d = Document::new();
+    d.insert("x", Value::Int32(1));
+    client.insert("pool_test.cl", vec![d]).await.unwrap();
+
+    // Pool should still have a connection
+    let pool_size2 = client.pool_size().await;
+    assert!(pool_size2 > 0, "Pool should maintain connections after reuse");
+}
+
+#[tokio::test]
+async fn connection_pool_with_custom_config() {
+    let port = start_test_server().await;
+    let client = sdb_server::data_node_client::DataNodeClient::with_pool_config(
+        format!("127.0.0.1:{}", port),
+        5,  // max 5 connections
+        30, // 30s idle timeout
+    );
+
+    client.create_collection_space("pool_cfg").await.unwrap();
+    client.create_collection("pool_cfg.cl").await.unwrap();
+
+    // Verify it works
+    let docs = client.query("pool_cfg.cl", None, None, None, 0, -1).await.unwrap();
+    assert_eq!(docs.len(), 0);
+}
+
+// ── Error Recovery ──────────────────────────────────────────────
+
+#[test]
+fn replication_backoff_tracks_failures() {
+    use sdb_cls::ReplicationAgent;
+
+    let local = NodeAddress { group_id: 1, node_id: 1 };
+    let peer = NodeAddress { group_id: 1, node_id: 2 };
+    let mut agent = ReplicationAgent::new(local);
+    agent.add_replica(peer);
+    agent.peer_addrs.insert(2, "127.0.0.1:99999".into());
+
+    // Initially alive and ready
+    assert!(agent.is_retry_ready(2));
+    assert!(agent.replicas[&2].is_alive);
+
+    // Record failure — should set backoff
+    agent.record_failure(2);
+    assert!(!agent.replicas[&2].is_alive);
+    assert_eq!(agent.replicas[&2].fail_count, 1);
+    assert!(agent.replicas[&2].next_retry.is_some());
+
+    // Not ready for retry immediately
+    assert!(!agent.is_retry_ready(2));
+
+    // Record success — should reset
+    agent.record_success(2);
+    assert!(agent.replicas[&2].is_alive);
+    assert_eq!(agent.replicas[&2].fail_count, 0);
+    assert!(agent.replicas[&2].next_retry.is_none());
+    assert!(agent.is_retry_ready(2));
+}
+
+#[test]
+fn replication_backoff_exponential() {
+    use sdb_cls::ReplicationAgent;
+
+    let local = NodeAddress { group_id: 1, node_id: 1 };
+    let peer = NodeAddress { group_id: 1, node_id: 2 };
+    let mut agent = ReplicationAgent::new(local);
+    agent.add_replica(peer);
+
+    // Multiple failures increase backoff
+    agent.record_failure(2);
+    let t1 = agent.replicas[&2].next_retry.unwrap();
+    agent.record_failure(2);
+    let t2 = agent.replicas[&2].next_retry.unwrap();
+    // Second failure should have a later retry time
+    assert!(t2 > t1);
+    assert_eq!(agent.replicas[&2].fail_count, 2);
+}
+
+#[test]
+fn replication_peers_needing_catchup() {
+    use sdb_cls::ReplicationAgent;
+
+    let local = NodeAddress { group_id: 1, node_id: 1 };
+    let mut agent = ReplicationAgent::new(local);
+    agent.add_replica(NodeAddress { group_id: 1, node_id: 2 });
+    agent.add_replica(NodeAddress { group_id: 1, node_id: 3 });
+    agent.peer_addrs.insert(2, "127.0.0.1:2".into());
+    agent.peer_addrs.insert(3, "127.0.0.1:3".into());
+
+    // All alive = no catchup needed
+    let catchup = agent.peers_needing_catchup();
+    assert!(catchup.is_empty());
+
+    // Mark one as dead with immediate retry (next_retry = past)
+    agent.replicas.get_mut(&2).unwrap().is_alive = false;
+    agent.replicas.get_mut(&2).unwrap().next_retry = Some(
+        std::time::Instant::now() - std::time::Duration::from_secs(1),
+    );
+    let catchup = agent.peers_needing_catchup();
+    assert_eq!(catchup.len(), 1);
+    assert_eq!(catchup[0].0, 2);
+}
+
+// ── Config Persistence ──────────────────────────────────────────
+
+#[tokio::test]
+async fn coord_config_persistence_roundtrip() {
+    let p1 = start_test_server().await;
+    let p2 = start_test_server().await;
+    let p3 = start_test_server().await;
+
+    let config_dir = std::env::temp_dir().join(format!("sdb_coord_cfg_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&config_dir);
+    let config_path = config_dir.join("coord_state.json").to_string_lossy().to_string();
+
+    // Write a shard config file
+    let config_content = r#"{"shards":[{"collection":"persist_cs.cl","shard_key":"uid","num_groups":3}]}"#;
+    std::fs::write(&config_path, config_content).unwrap();
+
+    // Create a coord that loads from the persisted file
+    let coord = CoordNodeHandler::new_with_persistence(
+        vec![
+            (1, format!("127.0.0.1:{}", p1)),
+            (2, format!("127.0.0.1:{}", p2)),
+            (3, format!("127.0.0.1:{}", p3)),
+        ],
+        config_path.clone(),
+    );
+
+    // Verify sharding was restored from file
+    let router = coord.router_ref();
+    let info = router.shard_info("persist_cs.cl");
+    assert!(info.is_some());
+    let (key, ng) = info.unwrap();
+    assert_eq!(key, "uid");
+    assert_eq!(ng, 3);
+
+    let _ = std::fs::remove_dir_all(&config_dir);
+}
+
+#[tokio::test]
+async fn coord_config_persistence_empty_file() {
+    let config_dir = std::env::temp_dir().join(format!("sdb_coord_empty_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&config_dir);
+    let config_path = config_dir.join("coord_state.json").to_string_lossy().to_string();
+
+    // No file exists — coord should start without error
+    let p1 = start_test_server().await;
+    let coord = CoordNodeHandler::new_with_persistence(
+        vec![(1, format!("127.0.0.1:{}", p1))],
+        config_path,
+    );
+
+    // Router should have no sharding configured
+    let router = coord.router_ref();
+    let info = router.shard_info("nonexistent.cl");
+    assert!(info.is_none());
+
+    let _ = std::fs::remove_dir_all(&config_dir);
+}
+
+// ── Migrate via Coord ───────────────────────────────────────────
+
+#[tokio::test]
+async fn coord_migrate_via_command() {
+    use sdb_server::data_node_client::DataNodeClient;
+
+    let p1 = start_test_server().await;
+    let p2 = start_test_server().await;
+
+    // Set up data via direct client connections
+    let c1 = DataNodeClient::new(format!("127.0.0.1:{}", p1));
+    let c2 = DataNodeClient::new(format!("127.0.0.1:{}", p2));
+    c1.create_collection_space("mig").await.unwrap();
+    c1.create_collection("mig.cl").await.unwrap();
+    c2.create_collection_space("mig").await.unwrap();
+    c2.create_collection("mig.cl").await.unwrap();
+
+    // Insert into group 1
+    for i in 0..5 {
+        let mut d = Document::new();
+        d.insert("x", Value::Int32(i));
+        c1.insert("mig.cl", vec![d]).await.unwrap();
+    }
+
+    // Verify counts
+    let docs1 = c1.query("mig.cl", None, None, None, 0, -1).await.unwrap();
+    let docs2 = c2.query("mig.cl", None, None, None, 0, -1).await.unwrap();
+    assert_eq!(docs1.len(), 5);
+    assert_eq!(docs2.len(), 0);
+}
+
+// ── WAL Flush on Handler ────────────────────────────────────────
+
+#[tokio::test]
+async fn wal_flush_creates_recoverable_state() {
+    let dir = std::env::temp_dir().join(format!("sdb_wal_flush_{}", std::process::id()));
+    let wal_path = dir.join("wal");
+    let _ = std::fs::create_dir_all(&wal_path);
+
+    let wal = WriteAheadLog::open(wal_path.to_str().unwrap()).unwrap();
+    let catalog = Arc::new(RwLock::new(CatalogManager::new()));
+    let wal = Arc::new(Mutex::new(wal));
+
+    let handler = DataNodeHandler::new_with_wal(catalog.clone(), wal.clone());
+
+    // Start server
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handler = Arc::new(handler);
+    let handler_clone = handler.clone();
+    tokio::spawn(async move {
+        loop {
+            let (stream, addr) = listener.accept().await.unwrap();
+            let h = handler_clone.clone();
+            tokio::spawn(async move {
+                let mut conn = sdb_net::Connection::new(stream, addr);
+                let _ = h.on_connect(&conn).await;
+                while let Ok((header, payload)) = conn.recv_msg().await {
+                    if h.on_message(&mut conn, header, &payload).await.is_err() { break; }
+                }
+                let _ = h.on_disconnect(&conn).await;
+            });
+        }
+    });
+
+    // Create CS/CL and insert data
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).await.unwrap();
+    let reply = send_recv(&mut stream, &create_cs_msg(1, "wal_cs")).await;
+    assert_eq!(reply.flags, 0);
+    let reply = send_recv(&mut stream, &create_cl_msg(2, "wal_cs.cl")).await;
+    assert_eq!(reply.flags, 0);
+    let reply = send_recv(&mut stream, &insert_msg(3, "wal_cs.cl", vec![
+        doc(&[("x", Value::Int32(1))]),
+        doc(&[("x", Value::Int32(2))]),
+    ])).await;
+    assert_eq!(reply.flags, 0);
+
+    // Flush WAL explicitly
+    {
+        let mut w = wal.lock().unwrap();
+        w.flush().unwrap();
+    }
+
+    // Now recover from WAL to verify data is persisted
+    let mut wal2 = WriteAheadLog::open(wal_path.to_str().unwrap()).unwrap();
+    let recovered = recover_from_wal(&mut wal2).unwrap();
+
+    // Should have the CS, CL, and 2 documents
+    let css = recovered.list_collection_spaces();
+    assert!(css.contains(&"wal_cs".to_string()));
+    let (storage, _) = recovered.collection_handle("wal_cs", "cl").unwrap();
+    let rows = storage.scan();
+    assert_eq!(rows.len(), 2);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

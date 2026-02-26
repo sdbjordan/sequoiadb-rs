@@ -1,4 +1,5 @@
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use sdb_bson::{Document, Value};
 use sdb_common::{Result, SdbError};
@@ -10,10 +11,19 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex as TokioMutex;
 
+/// A pooled TCP connection with idle tracking.
+struct PooledConn {
+    stream: TcpStream,
+    last_used: Instant,
+}
+
 /// TCP client for communicating with a DataNode server.
+/// Maintains a pool of connections for concurrent use.
 pub struct DataNodeClient {
     addr: String,
-    stream: TokioMutex<Option<TcpStream>>,
+    pool: TokioMutex<Vec<PooledConn>>,
+    max_pool_size: usize,
+    idle_timeout: Duration,
     next_rid: AtomicU64,
 }
 
@@ -21,7 +31,19 @@ impl DataNodeClient {
     pub fn new(addr: String) -> Self {
         Self {
             addr,
-            stream: TokioMutex::new(None),
+            pool: TokioMutex::new(Vec::new()),
+            max_pool_size: 10,
+            idle_timeout: Duration::from_secs(60),
+            next_rid: AtomicU64::new(1),
+        }
+    }
+
+    pub fn with_pool_config(addr: String, max_pool_size: usize, idle_timeout_secs: u64) -> Self {
+        Self {
+            addr,
+            pool: TokioMutex::new(Vec::new()),
+            max_pool_size,
+            idle_timeout: Duration::from_secs(idle_timeout_secs),
             next_rid: AtomicU64::new(1),
         }
     }
@@ -30,23 +52,59 @@ impl DataNodeClient {
         self.next_rid.fetch_add(1, Ordering::Relaxed)
     }
 
-    async fn ensure_connected(&self) -> Result<()> {
-        let mut guard = self.stream.lock().await;
-        if guard.is_none() {
-            let stream = TcpStream::connect(&self.addr)
-                .await
-                .map_err(|_| SdbError::NetworkError)?;
-            *guard = Some(stream);
+    /// Acquire a connection from the pool, or create a new one.
+    /// Evicts idle connections that have exceeded the timeout.
+    async fn acquire(&self) -> Result<TcpStream> {
+        let mut pool = self.pool.lock().await;
+        // Evict expired connections
+        let cutoff = Instant::now() - self.idle_timeout;
+        pool.retain(|c| c.last_used > cutoff);
+
+        // Try to reuse an existing connection
+        if let Some(conn) = pool.pop() {
+            return Ok(conn.stream);
         }
-        Ok(())
+        drop(pool);
+
+        // Create new connection
+        TcpStream::connect(&self.addr)
+            .await
+            .map_err(|_| SdbError::NetworkError)
     }
 
-    /// Send raw bytes and receive a reply. Ensures connected first.
-    async fn send_recv_raw(&self, bytes: &[u8]) -> Result<MsgOpReply> {
-        self.ensure_connected().await?;
-        let mut guard = self.stream.lock().await;
-        let stream = guard.as_mut().ok_or(SdbError::NetworkClose)?;
+    /// Return a connection to the pool if there's room.
+    async fn release(&self, stream: TcpStream) {
+        let mut pool = self.pool.lock().await;
+        if pool.len() < self.max_pool_size {
+            pool.push(PooledConn {
+                stream,
+                last_used: Instant::now(),
+            });
+        }
+        // else: drop the stream (close the connection)
+    }
 
+    /// Send raw bytes and receive a reply using a pooled connection.
+    async fn send_recv_raw(&self, bytes: &[u8]) -> Result<MsgOpReply> {
+        let mut stream = self.acquire().await?;
+
+        let result = Self::do_send_recv(&mut stream, bytes).await;
+
+        match &result {
+            Ok(_) => {
+                // Return to pool on success
+                self.release(stream).await;
+            }
+            Err(_) => {
+                // Drop broken connection (don't return to pool)
+            }
+        }
+
+        result
+    }
+
+    /// Perform the actual send/receive on a stream.
+    async fn do_send_recv(stream: &mut TcpStream, bytes: &[u8]) -> Result<MsgOpReply> {
         stream
             .write_all(bytes)
             .await
@@ -85,6 +143,11 @@ impl DataNodeClient {
         } else {
             Err(i32_to_error(reply.flags))
         }
+    }
+
+    /// Get the number of idle connections in the pool.
+    pub async fn pool_size(&self) -> usize {
+        self.pool.lock().await.len()
     }
 
     // ── DDL methods ─────────────────────────────────────────────────

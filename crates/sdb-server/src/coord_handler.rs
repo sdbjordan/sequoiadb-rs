@@ -18,6 +18,20 @@ use sdb_net::MessageHandler;
 use crate::cursor_manager::CursorManager;
 use crate::data_node_client::DataNodeClient;
 
+/// Persisted shard configuration.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PersistedShardConfig {
+    collection: String,
+    shard_key: String,
+    num_groups: u32,
+}
+
+/// Persisted coordinator state.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct PersistedCoordState {
+    shards: Vec<PersistedShardConfig>,
+}
+
 struct CoordTxnState {
     group_txns: HashMap<GroupId, u64>, // group_id -> txn_id on that data node
 }
@@ -34,6 +48,8 @@ pub struct CoordNodeHandler {
     coord_txns: StdMutex<HashMap<SocketAddr, CoordTxnState>>,
     read_prefs: StdMutex<HashMap<SocketAddr, ReadPreference>>,
     metrics: Arc<Metrics>,
+    /// Path to persist shard config (None = ephemeral).
+    config_path: Option<String>,
 }
 
 impl CoordNodeHandler {
@@ -52,7 +68,61 @@ impl CoordNodeHandler {
             coord_txns: StdMutex::new(HashMap::new()),
             read_prefs: StdMutex::new(HashMap::new()),
             metrics: Arc::new(Metrics::new()),
+            config_path: None,
         }
+    }
+
+    /// Create a coordinator with config persistence.
+    pub fn new_with_persistence(data_nodes: Vec<(GroupId, String)>, config_path: String) -> Self {
+        let mut handler = Self::new(data_nodes);
+        handler.config_path = Some(config_path.clone());
+
+        // Load persisted shard config if it exists
+        if let Ok(data) = std::fs::read_to_string(&config_path) {
+            if let Ok(state) = serde_json::from_str::<PersistedCoordState>(&data) {
+                for shard in &state.shards {
+                    let _ = handler.set_shard(&shard.collection, &shard.shard_key, shard.num_groups);
+                }
+                tracing::info!("Loaded {} shard configs from {}", state.shards.len(), config_path);
+            }
+        }
+
+        handler
+    }
+
+    /// Persist current shard configuration to disk.
+    fn persist_config(&self) {
+        let config_path = match &self.config_path {
+            Some(p) => p,
+            None => return,
+        };
+        let router = match self.router.read() {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        let collections = router.sharded_collections();
+        let shards: Vec<PersistedShardConfig> = collections
+            .iter()
+            .filter_map(|col| {
+                router.shard_info(col).map(|(key, ng)| PersistedShardConfig {
+                    collection: col.clone(),
+                    shard_key: key,
+                    num_groups: ng,
+                })
+            })
+            .collect();
+        let state = PersistedCoordState { shards };
+        if let Ok(json) = serde_json::to_string_pretty(&state) {
+            if let Some(parent) = std::path::Path::new(config_path).parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(config_path, json);
+        }
+    }
+
+    /// Get a read-only reference to the router (for tests/inspection).
+    pub fn router_ref(&self) -> std::sync::RwLockReadGuard<'_, CoordRouter> {
+        self.router.read().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Register a secondary node for a group (for read preference routing).
@@ -569,7 +639,9 @@ impl CoordNodeHandler {
             Some(Value::Int64(n)) => *n as u32,
             _ => self.clients.len() as u32,
         };
-        self.set_shard(&collection, &shard_key, num_groups)
+        self.set_shard(&collection, &shard_key, num_groups)?;
+        self.persist_config();
+        Ok(())
     }
 
     fn cmd_get_shard_info(&self, query: &MsgOpQuery) -> Result<Vec<Document>> {
@@ -711,6 +783,7 @@ impl CoordNodeHandler {
     }
 
     /// Migrate documents from source group to target group.
+    /// On failure, rolls back any partially-inserted docs on target.
     async fn migrate_data(&self, collection: &str, source: GroupId, target: GroupId, count: u64) -> Result<()> {
         let source_client = self.clients.get(&source).ok_or(SdbError::NodeNotFound)?;
         let target_client = self.clients.get(&target).ok_or(SdbError::NodeNotFound)?;
@@ -721,6 +794,25 @@ impl CoordNodeHandler {
             router.set_migrating(collection, source, true);
         }
 
+        let result = self.do_migrate(collection, source_client, target_client, count).await;
+
+        // Clear migrating flag regardless of success/failure
+        {
+            let mut router = self.router.write().map_err(|_| SdbError::Sys)?;
+            router.set_migrating(collection, source, false);
+        }
+
+        result
+    }
+
+    /// Inner migration logic with rollback on failure.
+    async fn do_migrate(
+        &self,
+        collection: &str,
+        source_client: &DataNodeClient,
+        target_client: &DataNodeClient,
+        count: u64,
+    ) -> Result<()> {
         // Read docs from source (get `count` docs)
         let docs = source_client.query(
             collection,
@@ -731,20 +823,37 @@ impl CoordNodeHandler {
             count as i64,
         ).await?;
 
-        if !docs.is_empty() {
-            // Insert into target
-            target_client.insert(collection, docs.clone()).await?;
-
-            // Delete from source (by matching each doc)
-            for doc in &docs {
-                source_client.delete(collection, doc.clone()).await?;
-            }
+        if docs.is_empty() {
+            return Ok(());
         }
 
-        // Clear migrating flag
-        {
-            let mut router = self.router.write().map_err(|_| SdbError::Sys)?;
-            router.set_migrating(collection, source, false);
+        // Insert into target
+        if let Err(e) = target_client.insert(collection, docs.clone()).await {
+            tracing::error!("Migration insert to target failed: {}, no rollback needed", e);
+            return Err(e);
+        }
+
+        // Delete from source — if this fails, rollback the inserts on target
+        let mut deleted = Vec::new();
+        for doc in &docs {
+            match source_client.delete(collection, doc.clone()).await {
+                Ok(()) => deleted.push(doc.clone()),
+                Err(e) => {
+                    tracing::error!(
+                        "Migration delete from source failed after {} docs: {}. Rolling back target.",
+                        deleted.len(), e
+                    );
+                    // Rollback: delete from target what we successfully inserted
+                    for d in &docs {
+                        let _ = target_client.delete(collection, d.clone()).await;
+                    }
+                    // Re-insert the deleted docs back to source
+                    if !deleted.is_empty() {
+                        let _ = source_client.insert(collection, deleted).await;
+                    }
+                    return Err(e);
+                }
+            }
         }
 
         Ok(())

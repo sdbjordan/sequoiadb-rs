@@ -1748,6 +1748,27 @@ impl DataNodeHandler {
             }
 
             if is_primary {
+                // Try to catch up failed peers (reconnect with backoff)
+                {
+                    if let Ok(mut ag) = agent.try_lock() {
+                        let catchup_peers = ag.peers_needing_catchup();
+                        for (peer_id, from_lsn) in catchup_peers {
+                            if let Some(addr) = ag.peer_addrs.get(&peer_id).cloned() {
+                                // Quick connectivity check
+                                match TcpStream::connect(&addr).await {
+                                    Ok(_) => {
+                                        ag.record_success(peer_id);
+                                        tracing::info!("Peer {} reconnected (from LSN {})", peer_id, from_lsn);
+                                    }
+                                    Err(_) => {
+                                        ag.record_failure(peer_id);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // Send heartbeat to all peers
                 let current_term = {
                     let em = em.lock().unwrap_or_else(|e| e.into_inner());
