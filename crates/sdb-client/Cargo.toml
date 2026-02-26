@@ -13,3 +13,7 @@ sdb-net = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+sdb-cat = { workspace = true }
+sdb-server = { workspace = true }
