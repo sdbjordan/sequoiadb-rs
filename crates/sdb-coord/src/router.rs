@@ -99,6 +99,24 @@ impl CoordRouter {
         self.shard_managers.get(collection)?.find_imbalance()
     }
 
+    /// Get shard type for a collection: "hash", "range", or None.
+    pub fn shard_type(&self, collection: &str) -> Option<&'static str> {
+        let sm = self.shard_managers.get(collection)?;
+        if sm.shard_key.is_none() {
+            return None;
+        }
+        if sm.is_range_sharded() {
+            Some("range")
+        } else {
+            Some("hash")
+        }
+    }
+
+    /// Get a mutable reference to the shard manager for a collection.
+    pub fn shard_manager_mut(&mut self, collection: &str) -> Option<&mut ShardManager> {
+        self.shard_managers.get_mut(collection)
+    }
+
     /// Get all sharded collection names.
     pub fn sharded_collections(&self) -> Vec<String> {
         self.shard_managers.keys().cloned().collect()

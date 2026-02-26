@@ -6,12 +6,14 @@ use sdb_common::NodeAddress;
 use sdb_dps::WriteAheadLog;
 use tracing_subscriber::EnvFilter;
 
+mod catalog_handler;
 mod coord_handler;
 mod cursor_manager;
 mod data_node_client;
 mod data_store;
 mod handler;
 
+use catalog_handler::CatalogNodeHandler;
 use coord_handler::CoordNodeHandler;
 use data_store::DataStore;
 use handler::DataNodeHandler;
@@ -161,9 +163,24 @@ async fn start_coord(config: &NodeConfig) {
 
 async fn start_catalog(config: &NodeConfig) {
     tracing::info!(port = config.port, "Starting catalog node");
-    // Stub: initialize catalog components
-    let _catalog = sdb_cat::CatalogManager::new();
+
+    let handler = Arc::new(CatalogNodeHandler::new(&config.db_path));
+
+    let mut frame = sdb_net::NetFrame::new(format!("{}:{}", config.host, config.port));
+    let shutdown_tx = frame.shutdown_sender();
+    frame.set_handler(handler);
+
+    // Install SIGTERM/SIGINT handler
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("Received shutdown signal (catalog)");
+        let _ = shutdown_tx.send(true);
+    });
+
     tracing::info!("Catalog node ready");
+    if let Err(e) = frame.run().await {
+        tracing::error!("Catalog node error: {}", e);
+    }
 }
 
 async fn start_data(config: &NodeConfig) {

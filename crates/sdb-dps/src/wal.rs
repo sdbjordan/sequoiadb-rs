@@ -246,6 +246,11 @@ impl WriteAheadLog {
         self.flushed_lsn
     }
 
+    /// Return the WAL directory path.
+    pub fn log_path(&self) -> &str {
+        &self.log_path
+    }
+
     fn wal_file_path(&self) -> String {
         let mut p = PathBuf::from(&self.log_path);
         p.push("wal.sdb");

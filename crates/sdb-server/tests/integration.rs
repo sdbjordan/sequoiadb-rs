@@ -14,6 +14,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 // We import the handler from the server crate's lib
+use sdb_server::catalog_handler::CatalogNodeHandler;
 use sdb_server::coord_handler::CoordNodeHandler;
 use sdb_server::handler::{recover_from_wal, DataNodeHandler};
 
@@ -2723,6 +2724,533 @@ async fn wal_flush_creates_recoverable_state() {
     let (storage, _) = recovered.collection_handle("wal_cs", "cl").unwrap();
     let rows = storage.scan();
     assert_eq!(rows.len(), 2);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── Tier 3: Oplog Tailing Cursor ────────────────────────────────────────
+
+fn watch_msg(request_id: u64, collection: Option<&str>, start_lsn: Option<i64>) -> Vec<u8> {
+    let mut cond = Document::new();
+    if let Some(col) = collection {
+        cond.insert("Collection", Value::String(col.into()));
+    }
+    if let Some(lsn) = start_lsn {
+        cond.insert("StartLSN", Value::Int64(lsn));
+    }
+    let query = MsgOpQuery::new(request_id, "$watch", Some(cond), None, None, None, 0, -1, 0);
+    query.encode()
+}
+
+#[tokio::test]
+async fn oplog_watch_returns_cursor() {
+    // Start a WAL-backed data node
+    let dir = wal_tmp_dir("oplog_watch");
+    let port = start_wal_test_server(&dir).await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).await.unwrap();
+
+    // Create CS/CL and insert some data to populate WAL
+    send_recv(&mut stream, &create_cs_msg(1, "oplog_cs")).await;
+    send_recv(&mut stream, &create_cl_msg(2, "oplog_cs.cl")).await;
+    send_recv(&mut stream, &insert_msg(3, "oplog_cs.cl", vec![
+        doc(&[("x", Value::Int32(1))]),
+        doc(&[("x", Value::Int32(2))]),
+    ])).await;
+
+    // Watch from beginning of WAL (LSN 32 = FILE_HEADER_SIZE)
+    let reply = send_recv(&mut stream, &watch_msg(10, None, Some(32))).await;
+    assert_eq!(reply.flags, 0);
+    // Should get a tailing cursor
+    assert!(reply.context_id > 0, "Expected a tailing cursor, got context_id={}", reply.context_id);
+    // Should have some oplog entries from the DDL + insert operations
+    assert!(!reply.docs.is_empty(), "Expected oplog entries, got none");
+
+    // Verify oplog entries have expected fields
+    let first = &reply.docs[0];
+    assert!(first.get("lsn").is_some());
+    assert!(first.get("op").is_some());
+
+    // GetMore on the tailing cursor should not exhaust it
+    let reply2 = send_recv(&mut stream, &get_more_msg(11, reply.context_id)).await;
+    assert_eq!(reply2.flags, 0);
+    // Tailing cursor stays open (context_id > 0)
+    assert!(reply2.context_id > 0);
+
+    // Kill the oplog cursor
+    let reply3 = send_recv(&mut stream, &kill_context_msg(12, vec![reply.context_id])).await;
+    assert_eq!(reply3.flags, 0);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn oplog_watch_from_current_lsn() {
+    let dir = wal_tmp_dir("oplog_current");
+    let port = start_wal_test_server(&dir).await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).await.unwrap();
+
+    // Create CS/CL
+    send_recv(&mut stream, &create_cs_msg(1, "ocs")).await;
+    send_recv(&mut stream, &create_cl_msg(2, "ocs.cl")).await;
+
+    // Watch without StartLSN → should start from current position (see future writes only)
+    let reply = send_recv(&mut stream, &watch_msg(10, None, None)).await;
+    assert_eq!(reply.flags, 0);
+    let ctx = reply.context_id;
+    assert!(ctx > 0);
+    // Initial batch should be empty since we're watching from "now"
+    // (The DDL happened before the watch)
+    assert!(reply.docs.is_empty());
+
+    // Now insert some data
+    send_recv(&mut stream, &insert_msg(11, "ocs.cl", vec![
+        doc(&[("y", Value::Int32(99))]),
+    ])).await;
+
+    // GetMore should pick up the new insert
+    let reply2 = send_recv(&mut stream, &get_more_msg(12, ctx)).await;
+    assert_eq!(reply2.flags, 0);
+    // Should have the insert oplog entry
+    assert!(!reply2.docs.is_empty(), "Expected new oplog entry after insert");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── Tier 3: Catalog Node Persistence ────────────────────────────────────
+
+#[tokio::test]
+async fn catalog_node_starts_and_accepts_connections() {
+    let dir = std::env::temp_dir().join("sdb_cat_node_test");
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::create_dir_all(&dir);
+
+    let handler: Arc<dyn MessageHandler> = Arc::new(CatalogNodeHandler::new(dir.to_str().unwrap()));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    tokio::spawn(async move {
+        loop {
+            let (stream, addr) = listener.accept().await.unwrap();
+            let h = handler.clone();
+            tokio::spawn(async move {
+                let mut conn = sdb_net::Connection::new(stream, addr);
+                let _ = h.on_connect(&conn).await;
+                while let Ok((header, payload)) = conn.recv_msg().await {
+                    if h.on_message(&mut conn, header, &payload).await.is_err() { break; }
+                }
+                let _ = h.on_disconnect(&conn).await;
+            });
+        }
+    });
+
+    // Connect and create a CS via the catalog node
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).await.unwrap();
+    let reply = send_recv(&mut stream, &create_cs_msg(1, "catcs")).await;
+    assert_eq!(reply.flags, 0);
+
+    // Create a CL
+    let reply = send_recv(&mut stream, &create_cl_msg(2, "catcs.cl1")).await;
+    assert_eq!(reply.flags, 0);
+
+    // Query catalog snapshot
+    let snap_query = MsgOpQuery::new(3, "$catalog snapshot", None, None, None, None, 0, -1, 0);
+    let reply = send_recv(&mut stream, &snap_query.encode()).await;
+    assert_eq!(reply.flags, 0);
+    assert_eq!(reply.docs.len(), 1);
+    assert_eq!(reply.docs[0].get("CollectionSpaces"), Some(&Value::Int32(1)));
+    assert_eq!(reply.docs[0].get("Collections"), Some(&Value::Int32(1)));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn catalog_node_persists_and_reloads() {
+    let dir = std::env::temp_dir().join("sdb_cat_persist_reload");
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::create_dir_all(&dir);
+    let dir_str = dir.to_str().unwrap().to_string();
+
+    // Create catalog, add data, persist
+    {
+        let handler = CatalogNodeHandler::new(&dir_str);
+        let snap = handler.snapshot();
+        assert!(snap.collection_spaces.is_empty());
+
+        // Simulate adding via direct meta manipulation (cmd_create_cs uses query)
+        let mut meta = handler.snapshot();
+        meta.collection_spaces.push(sdb_server::catalog_handler::CsEntry {
+            name: "persist_cs".into(),
+            collections: vec![sdb_server::catalog_handler::ClEntry {
+                name: "cl1".into(),
+                full_name: "persist_cs.cl1".into(),
+            }],
+        });
+        meta.groups.push(sdb_server::catalog_handler::GroupEntry {
+            group_id: 1,
+            name: "group1".into(),
+            nodes: vec![sdb_server::catalog_handler::NodeEntry {
+                node_id: 1,
+                host: "localhost".into(),
+                port: 11810,
+            }],
+            primary_node: Some(1),
+        });
+        meta.shard_configs.push(sdb_server::catalog_handler::ShardEntry {
+            collection: "persist_cs.cl1".into(),
+            shard_key: "user_id".into(),
+            shard_type: "hash".into(),
+            num_groups: 3,
+            ranges: Vec::new(),
+        });
+        // Write directly
+        let json = serde_json::to_string_pretty(&meta).unwrap();
+        std::fs::write(dir.join("catalog_meta.json"), json).unwrap();
+    }
+
+    // Reload and verify
+    let handler2 = CatalogNodeHandler::new(&dir_str);
+    let snap = handler2.snapshot();
+    assert_eq!(snap.collection_spaces.len(), 1);
+    assert_eq!(snap.collection_spaces[0].name, "persist_cs");
+    assert_eq!(snap.groups.len(), 1);
+    assert_eq!(snap.groups[0].group_id, 1);
+    assert_eq!(snap.shard_configs.len(), 1);
+    assert_eq!(snap.shard_configs[0].shard_key, "user_id");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn catalog_node_register_group() {
+    let dir = std::env::temp_dir().join("sdb_cat_reg_group");
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::create_dir_all(&dir);
+
+    let handler: Arc<dyn MessageHandler> = Arc::new(CatalogNodeHandler::new(dir.to_str().unwrap()));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    tokio::spawn(async move {
+        loop {
+            let (stream, addr) = listener.accept().await.unwrap();
+            let h = handler.clone();
+            tokio::spawn(async move {
+                let mut conn = sdb_net::Connection::new(stream, addr);
+                let _ = h.on_connect(&conn).await;
+                while let Ok((header, payload)) = conn.recv_msg().await {
+                    if h.on_message(&mut conn, header, &payload).await.is_err() { break; }
+                }
+                let _ = h.on_disconnect(&conn).await;
+            });
+        }
+    });
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).await.unwrap();
+
+    // Register a group
+    let mut cond = Document::new();
+    cond.insert("GroupId", Value::Int32(1));
+    cond.insert("Name", Value::String("dataGroup1".into()));
+    cond.insert("Host", Value::String("192.168.1.10".into()));
+    cond.insert("Port", Value::Int32(11810));
+    cond.insert("NodeId", Value::Int32(1));
+    let query = MsgOpQuery::new(1, "$register group", Some(cond), None, None, None, 0, -1, 0);
+    let reply = send_recv(&mut stream, &query.encode()).await;
+    assert_eq!(reply.flags, 0);
+
+    // List groups
+    let list_query = MsgOpQuery::new(2, "$list groups", None, None, None, None, 0, -1, 0);
+    let reply = send_recv(&mut stream, &list_query.encode()).await;
+    assert_eq!(reply.flags, 0);
+    assert_eq!(reply.docs.len(), 1);
+    assert_eq!(reply.docs[0].get("GroupId"), Some(&Value::Int32(1)));
+    assert_eq!(reply.docs[0].get("Name"), Some(&Value::String("dataGroup1".into())));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── Tier 3: Range Sharding ──────────────────────────────────────────────
+
+fn enable_range_sharding_msg(request_id: u64, collection: &str, shard_key: &str) -> Vec<u8> {
+    let mut cond = Document::new();
+    cond.insert("Collection", Value::String(collection.into()));
+    cond.insert("ShardKey", Value::String(shard_key.into()));
+    let query = MsgOpQuery::new(request_id, "$enable range sharding", Some(cond), None, None, None, 0, -1, 0);
+    query.encode()
+}
+
+fn add_range_msg(request_id: u64, collection: &str, group_id: u32, low: Option<i32>, up: Option<i32>) -> Vec<u8> {
+    let mut cond = Document::new();
+    cond.insert("Collection", Value::String(collection.into()));
+    cond.insert("GroupId", Value::Int32(group_id as i32));
+    if let Some(l) = low {
+        cond.insert("LowBound", Value::Int32(l));
+    }
+    if let Some(u) = up {
+        cond.insert("UpBound", Value::Int32(u));
+    }
+    let query = MsgOpQuery::new(request_id, "$add range", Some(cond), None, None, None, 0, -1, 0);
+    query.encode()
+}
+
+#[tokio::test]
+async fn range_sharding_routes_by_value() {
+    // Start 3 data nodes
+    let p1 = start_test_server().await;
+    let p2 = start_test_server().await;
+    let p3 = start_test_server().await;
+
+    let coord = CoordNodeHandler::new(vec![
+        (1, format!("127.0.0.1:{}", p1)),
+        (2, format!("127.0.0.1:{}", p2)),
+        (3, format!("127.0.0.1:{}", p3)),
+    ]);
+    let handler: Arc<dyn MessageHandler> = Arc::new(coord);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let coord_port = listener.local_addr().unwrap().port();
+
+    tokio::spawn(async move {
+        loop {
+            let (stream, addr) = listener.accept().await.unwrap();
+            let h = handler.clone();
+            tokio::spawn(async move {
+                let mut conn = sdb_net::Connection::new(stream, addr);
+                let _ = h.on_connect(&conn).await;
+                while let Ok((header, payload)) = conn.recv_msg().await {
+                    if h.on_message(&mut conn, header, &payload).await.is_err() { break; }
+                }
+                let _ = h.on_disconnect(&conn).await;
+            });
+        }
+    });
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", coord_port)).await.unwrap();
+
+    // Create CS/CL on all groups
+    send_recv(&mut stream, &create_cs_msg(1, "rng")).await;
+    send_recv(&mut stream, &create_cl_msg(2, "rng.cl")).await;
+
+    // Enable range sharding
+    let reply = send_recv(&mut stream, &enable_range_sharding_msg(3, "rng.cl", "age")).await;
+    assert_eq!(reply.flags, 0);
+
+    // Add ranges: group1=[,100), group2=[100,200), group3=[200,)
+    let reply = send_recv(&mut stream, &add_range_msg(4, "rng.cl", 1, None, Some(100))).await;
+    assert_eq!(reply.flags, 0);
+    let reply = send_recv(&mut stream, &add_range_msg(5, "rng.cl", 2, Some(100), Some(200))).await;
+    assert_eq!(reply.flags, 0);
+    let reply = send_recv(&mut stream, &add_range_msg(6, "rng.cl", 3, Some(200), None)).await;
+    assert_eq!(reply.flags, 0);
+
+    // Verify shard info shows range type
+    let reply = send_recv(&mut stream, &get_shard_info_msg(7, "rng.cl")).await;
+    assert_eq!(reply.flags, 0);
+    assert_eq!(reply.docs[0].get("ShardType"), Some(&Value::String("range".into())));
+
+    // Insert docs with different age values
+    for age in &[25, 50, 75, 125, 150, 175, 225, 250, 275] {
+        send_recv(&mut stream, &insert_msg(10 + *age as u64, "rng.cl", vec![
+            doc(&[("age", Value::Int32(*age)), ("name", Value::String(format!("user_{}", age)))]),
+        ])).await;
+    }
+
+    // Query with shard key should route to single group
+    let mut cond = Document::new();
+    cond.insert("age", Value::Int32(50));
+    let query = MsgOpQuery::new(100, "rng.cl", Some(cond), None, None, None, 0, -1, 0);
+    let reply = send_recv(&mut stream, &query.encode()).await;
+    assert_eq!(reply.flags, 0);
+    // Should find the doc with age=50 (in group 1)
+    assert!(reply.docs.iter().any(|d| d.get("age") == Some(&Value::Int32(50))));
+
+    // Query without shard key should broadcast and return all
+    let query_all = MsgOpQuery::new(101, "rng.cl", None, None, None, None, 0, -1, 0);
+    let reply = send_recv(&mut stream, &query_all.encode()).await;
+    assert_eq!(reply.flags, 0);
+    assert_eq!(reply.docs.len(), 9, "Expected all 9 docs across 3 groups");
+}
+
+#[tokio::test]
+async fn range_sharding_get_shard_info() {
+    let p1 = start_test_server().await;
+    let p2 = start_test_server().await;
+
+    let coord = CoordNodeHandler::new(vec![
+        (1, format!("127.0.0.1:{}", p1)),
+        (2, format!("127.0.0.1:{}", p2)),
+    ]);
+    let handler: Arc<dyn MessageHandler> = Arc::new(coord);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let coord_port = listener.local_addr().unwrap().port();
+
+    tokio::spawn(async move {
+        loop {
+            let (stream, addr) = listener.accept().await.unwrap();
+            let h = handler.clone();
+            tokio::spawn(async move {
+                let mut conn = sdb_net::Connection::new(stream, addr);
+                let _ = h.on_connect(&conn).await;
+                while let Ok((header, payload)) = conn.recv_msg().await {
+                    if h.on_message(&mut conn, header, &payload).await.is_err() { break; }
+                }
+                let _ = h.on_disconnect(&conn).await;
+            });
+        }
+    });
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", coord_port)).await.unwrap();
+
+    send_recv(&mut stream, &create_cs_msg(1, "rinfo")).await;
+    send_recv(&mut stream, &create_cl_msg(2, "rinfo.cl")).await;
+
+    // Enable range sharding and add ranges
+    send_recv(&mut stream, &enable_range_sharding_msg(3, "rinfo.cl", "score")).await;
+    send_recv(&mut stream, &add_range_msg(4, "rinfo.cl", 1, None, Some(50))).await;
+    send_recv(&mut stream, &add_range_msg(5, "rinfo.cl", 2, Some(50), None)).await;
+
+    // Get shard info
+    let reply = send_recv(&mut stream, &get_shard_info_msg(6, "rinfo.cl")).await;
+    assert_eq!(reply.flags, 0);
+    assert_eq!(reply.docs[0].get("Sharded"), Some(&Value::Boolean(true)));
+    assert_eq!(reply.docs[0].get("ShardKey"), Some(&Value::String("score".into())));
+    assert_eq!(reply.docs[0].get("ShardType"), Some(&Value::String("range".into())));
+}
+
+#[test]
+fn range_sharding_unit_test() {
+    use sdb_cls::shard::{ShardManager, ShardRange};
+
+    let mut sm = ShardManager::new();
+    sm.set_range_sharding("x");
+    sm.add_range("x", ShardRange { group_id: 1, low_bound: None, up_bound: Some(Value::Int32(100)) });
+    sm.add_range("x", ShardRange { group_id: 2, low_bound: Some(Value::Int32(100)), up_bound: Some(Value::Int32(200)) });
+    sm.add_range("x", ShardRange { group_id: 3, low_bound: Some(Value::Int32(200)), up_bound: None });
+
+    assert!(sm.is_range_sharded());
+
+    // Route by range
+    assert_eq!(sm.route(&doc(&[("x", Value::Int32(50))])).unwrap(), 1);
+    assert_eq!(sm.route(&doc(&[("x", Value::Int32(150))])).unwrap(), 2);
+    assert_eq!(sm.route(&doc(&[("x", Value::Int32(250))])).unwrap(), 3);
+
+    // Boundary: 100 goes to group 2 (>= 100)
+    assert_eq!(sm.route(&doc(&[("x", Value::Int32(100))])).unwrap(), 2);
+    // Boundary: 200 goes to group 3 (>= 200)
+    assert_eq!(sm.route(&doc(&[("x", Value::Int32(200))])).unwrap(), 3);
+}
+
+#[test]
+fn range_sharding_query_routing() {
+    use sdb_cls::shard::{ShardManager, ShardRange};
+
+    let mut sm = ShardManager::new();
+    sm.set_range_sharding("x");
+    sm.add_range("x", ShardRange { group_id: 1, low_bound: None, up_bound: Some(Value::Int32(100)) });
+    sm.add_range("x", ShardRange { group_id: 2, low_bound: Some(Value::Int32(100)), up_bound: None });
+
+    // Query with shard key routes to single group
+    let groups = sm.route_query(Some(&doc(&[("x", Value::Int32(50))])));
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0], 1);
+
+    // Query with shard key in second range
+    let groups = sm.route_query(Some(&doc(&[("x", Value::Int32(150))])));
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0], 2);
+
+    // Query without shard key broadcasts
+    let groups = sm.route_query(Some(&doc(&[("y", Value::Int32(50))])));
+    assert_eq!(groups.len(), 2);
+}
+
+#[test]
+fn range_sharding_chunks_created() {
+    use sdb_cls::shard::{ShardManager, ShardRange};
+
+    let mut sm = ShardManager::new();
+    sm.set_range_sharding("x");
+    sm.add_range("x", ShardRange { group_id: 1, low_bound: None, up_bound: Some(Value::Int32(100)) });
+    sm.add_range("x", ShardRange { group_id: 2, low_bound: Some(Value::Int32(100)), up_bound: None });
+
+    let chunks = sm.chunk_info();
+    assert_eq!(chunks.len(), 2);
+    assert_eq!(chunks[0].group_id, 1);
+    assert_eq!(chunks[0].low_bound, None);
+    assert_eq!(chunks[0].up_bound, Some(Value::Int32(100)));
+    assert_eq!(chunks[1].group_id, 2);
+    assert_eq!(chunks[1].low_bound, Some(Value::Int32(100)));
+    assert_eq!(chunks[1].up_bound, None);
+}
+
+#[test]
+fn log_op_as_str() {
+    use sdb_dps::LogOp;
+    assert_eq!(LogOp::Insert.as_str(), "insert");
+    assert_eq!(LogOp::Update.as_str(), "update");
+    assert_eq!(LogOp::Delete.as_str(), "delete");
+    assert_eq!(LogOp::CollectionCreate.as_str(), "createCL");
+    assert_eq!(LogOp::IndexCreate.as_str(), "createIndex");
+}
+
+#[test]
+fn oplog_cursor_manager_basics() {
+    use sdb_server::cursor_manager::CursorManager;
+
+    let mut mgr = CursorManager::new();
+
+    // Create oplog cursor
+    let ctx = mgr.create_oplog_cursor("/tmp/test_wal".into(), 32, Some("cs.cl".into()));
+    assert!(ctx > 0);
+    assert!(mgr.is_oplog_cursor(ctx));
+
+    // Regular get_more should not find it (it's an oplog cursor)
+    assert!(mgr.get_more(ctx, -1).is_none());
+
+    // Get oplog cursor
+    let oc = mgr.get_oplog_cursor_mut(ctx).unwrap();
+    assert_eq!(oc.resume_lsn, 32);
+    assert_eq!(oc.filter_collection.as_deref(), Some("cs.cl"));
+
+    // Update resume_lsn
+    oc.resume_lsn = 128;
+    let oc2 = mgr.get_oplog_cursor_mut(ctx).unwrap();
+    assert_eq!(oc2.resume_lsn, 128);
+
+    // Kill
+    assert!(mgr.kill(ctx));
+    assert!(!mgr.is_oplog_cursor(ctx));
+}
+
+#[test]
+fn catalog_handler_ddl_operations() {
+    let dir = std::env::temp_dir().join("sdb_cat_ddl_ops");
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::create_dir_all(&dir);
+
+    let handler = CatalogNodeHandler::new(dir.to_str().unwrap());
+
+    // Verify empty
+    let snap = handler.snapshot();
+    assert!(snap.collection_spaces.is_empty());
+
+    // Verify persistence file is created after operations
+    // (We test via the snapshot since cmd_ methods need MsgOpQuery)
+    let mut meta = handler.snapshot();
+    meta.collection_spaces.push(sdb_server::catalog_handler::CsEntry {
+        name: "ddl_cs".into(),
+        collections: vec![
+            sdb_server::catalog_handler::ClEntry { name: "cl1".into(), full_name: "ddl_cs.cl1".into() },
+            sdb_server::catalog_handler::ClEntry { name: "cl2".into(), full_name: "ddl_cs.cl2".into() },
+        ],
+    });
+    let json = serde_json::to_string_pretty(&meta).unwrap();
+    std::fs::write(dir.join("catalog_meta.json"), json).unwrap();
+
+    // Reload
+    let handler2 = CatalogNodeHandler::new(dir.to_str().unwrap());
+    let snap2 = handler2.snapshot();
+    assert_eq!(snap2.collection_spaces.len(), 1);
+    assert_eq!(snap2.collection_spaces[0].collections.len(), 2);
 
     let _ = std::fs::remove_dir_all(&dir);
 }

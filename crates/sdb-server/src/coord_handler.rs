@@ -18,12 +18,24 @@ use sdb_net::MessageHandler;
 use crate::cursor_manager::CursorManager;
 use crate::data_node_client::DataNodeClient;
 
+/// Persisted range boundary.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PersistedRange {
+    group_id: u32,
+    low_bound: Option<i64>,
+    up_bound: Option<i64>,
+}
+
 /// Persisted shard configuration.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct PersistedShardConfig {
     collection: String,
     shard_key: String,
     num_groups: u32,
+    #[serde(default)]
+    shard_type: String, // "hash" or "range"
+    #[serde(default)]
+    ranges: Vec<PersistedRange>,
 }
 
 /// Persisted coordinator state.
@@ -81,9 +93,25 @@ impl CoordNodeHandler {
         if let Ok(data) = std::fs::read_to_string(&config_path) {
             if let Ok(state) = serde_json::from_str::<PersistedCoordState>(&data) {
                 for shard in &state.shards {
-                    let _ = handler.set_shard(&shard.collection, &shard.shard_key, shard.num_groups);
+                    if shard.shard_type == "range" && !shard.ranges.is_empty() {
+                        let _ = handler.set_range_shard(
+                            &shard.collection,
+                            &shard.shard_key,
+                            &shard.ranges,
+                        );
+                    } else {
+                        let _ = handler.set_shard(
+                            &shard.collection,
+                            &shard.shard_key,
+                            shard.num_groups,
+                        );
+                    }
                 }
-                tracing::info!("Loaded {} shard configs from {}", state.shards.len(), config_path);
+                tracing::info!(
+                    "Loaded {} shard configs from {}",
+                    state.shards.len(),
+                    config_path
+                );
             }
         }
 
@@ -104,10 +132,36 @@ impl CoordNodeHandler {
         let shards: Vec<PersistedShardConfig> = collections
             .iter()
             .filter_map(|col| {
-                router.shard_info(col).map(|(key, ng)| PersistedShardConfig {
-                    collection: col.clone(),
-                    shard_key: key,
-                    num_groups: ng,
+                router.shard_info(col).map(|(key, ng)| {
+                    let stype = router.shard_type(col).unwrap_or("hash").to_string();
+                    let ranges = if stype == "range" {
+                        router
+                            .chunk_info(col)
+                            .iter()
+                            .map(|c| PersistedRange {
+                                group_id: c.group_id,
+                                low_bound: match &c.low_bound {
+                                    Some(Value::Int32(n)) => Some(*n as i64),
+                                    Some(Value::Int64(n)) => Some(*n),
+                                    _ => None,
+                                },
+                                up_bound: match &c.up_bound {
+                                    Some(Value::Int32(n)) => Some(*n as i64),
+                                    Some(Value::Int64(n)) => Some(*n),
+                                    _ => None,
+                                },
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    PersistedShardConfig {
+                        collection: col.clone(),
+                        shard_key: key,
+                        num_groups: ng,
+                        shard_type: stype,
+                        ranges,
+                    }
                 })
             })
             .collect();
@@ -169,7 +223,7 @@ impl CoordNodeHandler {
         self.clients.keys().copied().collect()
     }
 
-    /// Register sharding for a collection.
+    /// Register hash sharding for a collection.
     pub fn set_shard(
         &self,
         collection: &str,
@@ -179,6 +233,30 @@ impl CoordNodeHandler {
         let mut router = self.router.write().map_err(|_| SdbError::Sys)?;
         let mut sm = ShardManager::new();
         sm.set_hash_sharding(shard_key, num_groups);
+        router.register_shard(collection, sm);
+        Ok(())
+    }
+
+    /// Register range sharding for a collection from persisted config.
+    fn set_range_shard(
+        &self,
+        collection: &str,
+        shard_key: &str,
+        ranges: &[PersistedRange],
+    ) -> Result<()> {
+        let mut router = self.router.write().map_err(|_| SdbError::Sys)?;
+        let mut sm = ShardManager::new();
+        sm.set_range_sharding(shard_key);
+        for r in ranges {
+            sm.add_range(
+                shard_key,
+                sdb_cls::shard::ShardRange {
+                    group_id: r.group_id,
+                    low_bound: r.low_bound.map(Value::Int64),
+                    up_bound: r.up_bound.map(Value::Int64),
+                },
+            );
+        }
         router.register_shard(collection, sm);
         Ok(())
     }
@@ -236,6 +314,8 @@ impl CoordNodeHandler {
                 Err(e) => Err(e),
             },
             "$enable sharding" => self.cmd_enable_sharding(query),
+            "$enable range sharding" => self.cmd_enable_range_sharding(query),
+            "$add range" => self.cmd_add_range(query),
             "$get shard info" => match self.cmd_get_shard_info(query) {
                 Ok(docs) => return MsgOpReply::ok(header.opcode, header.request_id, docs),
                 Err(e) => Err(e),
@@ -644,6 +724,61 @@ impl CoordNodeHandler {
         Ok(())
     }
 
+    fn cmd_enable_range_sharding(&self, query: &MsgOpQuery) -> Result<()> {
+        let cond = query.condition.as_ref().ok_or(SdbError::InvalidArg)?;
+        let collection = match cond.get("Collection") {
+            Some(Value::String(s)) => s.clone(),
+            _ => return Err(SdbError::InvalidArg),
+        };
+        let shard_key = match cond.get("ShardKey") {
+            Some(Value::String(s)) => s.clone(),
+            _ => return Err(SdbError::InvalidArg),
+        };
+        {
+            let mut router = self.router.write().map_err(|_| SdbError::Sys)?;
+            let mut sm = ShardManager::new();
+            sm.set_range_sharding(&shard_key);
+            router.register_shard(&collection, sm);
+        }
+        self.persist_config();
+        Ok(())
+    }
+
+    fn cmd_add_range(&self, query: &MsgOpQuery) -> Result<()> {
+        let cond = query.condition.as_ref().ok_or(SdbError::InvalidArg)?;
+        let collection = match cond.get("Collection") {
+            Some(Value::String(s)) => s.clone(),
+            _ => return Err(SdbError::InvalidArg),
+        };
+        let group_id = match cond.get("GroupId") {
+            Some(Value::Int32(n)) => *n as u32,
+            _ => return Err(SdbError::InvalidArg),
+        };
+        let low_bound = cond.get("LowBound").cloned();
+        let up_bound = cond.get("UpBound").cloned();
+
+        {
+            let mut router = self.router.write().map_err(|_| SdbError::Sys)?;
+            let sm = router
+                .shard_manager_mut(&collection)
+                .ok_or(SdbError::CollectionNotFound)?;
+            let shard_key = sm
+                .shard_key
+                .clone()
+                .ok_or(SdbError::InvalidArg)?;
+            sm.add_range(
+                &shard_key,
+                sdb_cls::shard::ShardRange {
+                    group_id,
+                    low_bound,
+                    up_bound,
+                },
+            );
+        }
+        self.persist_config();
+        Ok(())
+    }
+
     fn cmd_get_shard_info(&self, query: &MsgOpQuery) -> Result<Vec<Document>> {
         let cond = query.condition.as_ref().ok_or(SdbError::InvalidArg)?;
         let collection = match cond.get("Collection") {
@@ -656,6 +791,8 @@ impl CoordNodeHandler {
             result.insert("Sharded", Value::Boolean(true));
             result.insert("ShardKey", Value::String(shard_key));
             result.insert("NumGroups", Value::Int32(num_groups as i32));
+            let stype = router.shard_type(&collection).unwrap_or("hash");
+            result.insert("ShardType", Value::String(stype.to_string()));
         } else {
             result.insert("Sharded", Value::Boolean(false));
         }

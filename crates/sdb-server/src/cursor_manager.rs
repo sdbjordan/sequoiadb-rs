@@ -1,4 +1,5 @@
-use sdb_bson::Document;
+use sdb_bson::{Document, Value};
+use sdb_common::Lsn;
 use std::collections::HashMap;
 
 const DEFAULT_BATCH_SIZE: usize = 100;
@@ -26,9 +27,20 @@ impl ServerCursor {
     }
 }
 
+/// Oplog tailing cursor — tracks a position in the WAL and returns new entries.
+pub struct OplogCursor {
+    /// WAL directory path for creating iterators.
+    pub wal_path: String,
+    /// LSN to scan from on next poll.
+    pub resume_lsn: Lsn,
+    /// Optional filter: only return ops matching this collection prefix.
+    pub filter_collection: Option<String>,
+}
+
 /// Manages server-side cursors for batched query results.
 pub struct CursorManager {
     cursors: HashMap<i64, ServerCursor>,
+    oplog_cursors: HashMap<i64, OplogCursor>,
     next_id: i64,
     batch_size: usize,
 }
@@ -37,6 +49,7 @@ impl CursorManager {
     pub fn new() -> Self {
         Self {
             cursors: HashMap::new(),
+            oplog_cursors: HashMap::new(),
             next_id: 1,
             batch_size: DEFAULT_BATCH_SIZE,
         }
@@ -54,6 +67,36 @@ impl CursorManager {
         let first_batch = cursor.next_batch(self.batch_size);
         self.cursors.insert(id, cursor);
         (first_batch, id)
+    }
+
+    /// Create an oplog tailing cursor. Returns a context_id.
+    pub fn create_oplog_cursor(
+        &mut self,
+        wal_path: String,
+        start_lsn: Lsn,
+        filter_collection: Option<String>,
+    ) -> i64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.oplog_cursors.insert(
+            id,
+            OplogCursor {
+                wal_path,
+                resume_lsn: start_lsn,
+                filter_collection,
+            },
+        );
+        id
+    }
+
+    /// Check if a context_id belongs to an oplog cursor.
+    pub fn is_oplog_cursor(&self, context_id: i64) -> bool {
+        self.oplog_cursors.contains_key(&context_id)
+    }
+
+    /// Get mutable reference to an oplog cursor.
+    pub fn get_oplog_cursor_mut(&mut self, context_id: i64) -> Option<&mut OplogCursor> {
+        self.oplog_cursors.get_mut(&context_id)
     }
 
     /// Get more documents from an open cursor.
@@ -76,13 +119,29 @@ impl CursorManager {
     /// Kill a cursor, freeing its resources.
     pub fn kill(&mut self, context_id: i64) -> bool {
         self.cursors.remove(&context_id).is_some()
+            || self.oplog_cursors.remove(&context_id).is_some()
     }
+}
+
+/// Convert a WAL LogRecord into a BSON Document for oplog output.
+pub fn log_record_to_document(record: &sdb_dps::LogRecord) -> Document {
+    let mut doc = Document::new();
+    doc.insert("lsn", Value::Int64(record.lsn as i64));
+    doc.insert("prevLsn", Value::Int64(record.prev_lsn as i64));
+    doc.insert("txnId", Value::Int64(record.txn_id as i64));
+    doc.insert("op", Value::String(record.op.as_str().to_string()));
+    // Try to decode data as BSON document; fallback to raw length
+    if let Ok(data_doc) = sdb_bson::Document::from_bytes(&record.data) {
+        doc.insert("data", Value::Document(data_doc));
+    } else if !record.data.is_empty() {
+        doc.insert("dataLen", Value::Int32(record.data.len() as i32));
+    }
+    doc
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sdb_bson::Value;
 
     fn make_docs(n: usize) -> Vec<Document> {
         (0..n)
@@ -138,5 +197,24 @@ mod tests {
         let (_, ctx) = mgr.create_cursor(make_docs(200));
         let (batch, _) = mgr.get_more(ctx, 50).unwrap();
         assert_eq!(batch.len(), 50);
+    }
+
+    #[test]
+    fn oplog_cursor_create_and_kill() {
+        let mut mgr = CursorManager::new();
+        let ctx = mgr.create_oplog_cursor("/tmp/wal".into(), 32, None);
+        assert!(ctx > 0);
+        assert!(mgr.is_oplog_cursor(ctx));
+        assert!(mgr.kill(ctx));
+        assert!(!mgr.is_oplog_cursor(ctx));
+    }
+
+    #[test]
+    fn oplog_cursor_with_filter() {
+        let mut mgr = CursorManager::new();
+        let ctx = mgr.create_oplog_cursor("/tmp/wal".into(), 32, Some("mycs.mycl".into()));
+        let oc = mgr.get_oplog_cursor_mut(ctx).unwrap();
+        assert_eq!(oc.filter_collection.as_deref(), Some("mycs.mycl"));
+        assert_eq!(oc.resume_lsn, 32);
     }
 }

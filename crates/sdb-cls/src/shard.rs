@@ -63,12 +63,41 @@ impl ShardManager {
         }
     }
 
+    /// Initialize range-based sharding with a shard key field.
+    /// Call add_range() afterwards to define boundaries.
+    pub fn set_range_sharding(&mut self, field: &str) {
+        self.shard_key = Some(field.to_string());
+        self.ranges.clear();
+        self.chunks.clear();
+        self.num_groups = 0; // will be determined by ranges
+    }
+
     /// Configure range-based sharding with explicit boundaries.
     pub fn add_range(&mut self, field: &str, range: ShardRange) {
         if self.shard_key.is_none() {
             self.shard_key = Some(field.to_string());
         }
+        // Track num_groups as max group_id seen
+        if range.group_id > self.num_groups {
+            self.num_groups = range.group_id;
+        }
+        // Create chunk for this range
+        let chunk = ChunkInfo {
+            chunk_id: self.next_chunk_id,
+            group_id: range.group_id,
+            low_bound: range.low_bound.clone(),
+            up_bound: range.up_bound.clone(),
+            doc_count: 0,
+            migrating: false,
+        };
+        self.next_chunk_id += 1;
+        self.chunks.push(chunk);
         self.ranges.push(range);
+    }
+
+    /// Check if this manager uses range-based sharding.
+    pub fn is_range_sharded(&self) -> bool {
+        !self.ranges.is_empty()
     }
 
     /// Determine the target group for a given document based on shard key.

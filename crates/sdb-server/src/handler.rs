@@ -375,6 +375,9 @@ impl DataNodeHandler {
                     "$add member" => self.cmd_add_member(query),
                     "$remove member" => self.cmd_remove_member(query),
                     "$get members" => self.cmd_get_members(),
+                    "$watch" => {
+                        return self.cmd_watch(header, query);
+                    }
                     _ => Err(SdbError::InvalidArg),
                 }
             }
@@ -806,6 +809,12 @@ impl DataNodeHandler {
         };
 
         let mut cursors = self.cursors.lock().unwrap();
+
+        // Check if this is an oplog tailing cursor
+        if cursors.is_oplog_cursor(msg.context_id) {
+            return self.oplog_get_more(&mut cursors, header, msg.context_id);
+        }
+
         match cursors.get_more(msg.context_id, msg.num_to_return) {
             Some((batch, exhausted)) => {
                 let mut reply = MsgOpReply::ok(header.opcode, header.request_id, batch);
@@ -816,6 +825,79 @@ impl DataNodeHandler {
                 MsgOpReply::error(header.opcode, header.request_id, &SdbError::QueryNotFound)
             }
         }
+    }
+
+    /// GetMore for an oplog tailing cursor — scans new WAL entries since last position.
+    fn oplog_get_more(
+        &self,
+        cursors: &mut CursorManager,
+        header: &MsgHeader,
+        context_id: i64,
+    ) -> MsgOpReply {
+        let flushed_lsn = match &self.wal {
+            Some(wal) => {
+                let w = wal.lock().unwrap_or_else(|e| e.into_inner());
+                w.flushed_lsn()
+            }
+            None => {
+                return MsgOpReply::error(header.opcode, header.request_id, &SdbError::InvalidArg);
+            }
+        };
+
+        let oc = match cursors.get_oplog_cursor_mut(context_id) {
+            Some(c) => c,
+            None => {
+                return MsgOpReply::error(
+                    header.opcode,
+                    header.request_id,
+                    &SdbError::QueryNotFound,
+                );
+            }
+        };
+
+        let mut docs = Vec::new();
+
+        if oc.resume_lsn < flushed_lsn {
+            let wal = self.wal.as_ref().unwrap().lock().unwrap();
+            if let Ok(iter) = wal.scan_from(oc.resume_lsn) {
+                let filter = oc.filter_collection.clone();
+                for record in iter.flatten() {
+                    oc.resume_lsn = record.lsn + 1;
+                    let doc = crate::cursor_manager::log_record_to_document(&record);
+                    // Apply collection filter
+                    if let Some(ref f) = filter {
+                        if let Some(Value::Document(data)) = doc.get("data") {
+                            let matches = match data.get("collection") {
+                                Some(Value::String(c)) => c == f,
+                                _ => match data.get("name") {
+                                    Some(Value::String(n)) => {
+                                        n == f || n.starts_with(&format!("{}.", f))
+                                    }
+                                    _ => true,
+                                },
+                            };
+                            if !matches {
+                                continue;
+                            }
+                        }
+                    }
+                    docs.push(doc);
+                    if docs.len() >= 100 {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Update resume_lsn to flushed if exhausted
+        if oc.resume_lsn < flushed_lsn {
+            oc.resume_lsn = flushed_lsn;
+        }
+
+        // Tailing cursor never exhausts — always return context_id
+        let mut reply = MsgOpReply::ok(header.opcode, header.request_id, docs);
+        reply.context_id = context_id;
+        reply
     }
 
     fn handle_kill_context(&self, header: &MsgHeader, payload: &[u8]) -> MsgOpReply {
@@ -1403,6 +1485,104 @@ impl DataNodeHandler {
             }
         }
         Ok(docs)
+    }
+
+    // ── Oplog watch ─────────────────────────────────────────────────
+
+    /// Create a tailing oplog cursor that follows the WAL.
+    /// Condition fields: Collection (optional filter), StartLSN (optional).
+    fn cmd_watch(&self, header: &MsgHeader, query: &MsgOpQuery) -> MsgOpReply {
+        // Determine WAL path — need WAL to be configured
+        let wal_path = match &self.wal {
+            Some(wal) => {
+                let w = wal.lock().unwrap_or_else(|e| e.into_inner());
+                w.log_path().to_string()
+            }
+            None => {
+                return MsgOpReply::error(
+                    header.opcode,
+                    header.request_id,
+                    &SdbError::InvalidArg,
+                );
+            }
+        };
+
+        // Parse optional StartLSN and Collection filter
+        let start_lsn = query
+            .condition
+            .as_ref()
+            .and_then(|c| match c.get("StartLSN") {
+                Some(Value::Int64(n)) => Some(*n as u64),
+                Some(Value::Int32(n)) => Some(*n as u64),
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                // Default: start from current WAL position (only see future writes)
+                let w = self.wal.as_ref().unwrap().lock().unwrap();
+                w.flushed_lsn()
+            });
+
+        let filter_collection = query
+            .condition
+            .as_ref()
+            .and_then(|c| match c.get("Collection") {
+                Some(Value::String(s)) => Some(s.clone()),
+                _ => None,
+            });
+
+        // Scan initial batch from WAL
+        let flushed_lsn = {
+            let w = self.wal.as_ref().unwrap().lock().unwrap();
+            w.flushed_lsn()
+        };
+
+        let mut docs = Vec::new();
+        let mut next_lsn = start_lsn;
+
+        if start_lsn < flushed_lsn {
+            let wal = self.wal.as_ref().unwrap().lock().unwrap();
+            if let Ok(iter) = wal.scan_from(start_lsn) {
+                for record in iter.flatten() {
+                    next_lsn = record.lsn + 1;
+                    let doc = crate::cursor_manager::log_record_to_document(&record);
+                    // Apply collection filter if set
+                    if let Some(ref filter) = filter_collection {
+                        if let Some(Value::Document(data)) = doc.get("data") {
+                            let matches = match data.get("collection") {
+                                Some(Value::String(c)) => c == filter,
+                                _ => match data.get("name") {
+                                    Some(Value::String(n)) => {
+                                        n == filter
+                                            || n.starts_with(&format!("{}.", filter))
+                                    }
+                                    _ => true,
+                                },
+                            };
+                            if !matches {
+                                continue;
+                            }
+                        }
+                    }
+                    docs.push(doc);
+                    if docs.len() >= 100 {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Update next_lsn to flushed if we exhausted current entries
+        if next_lsn < flushed_lsn {
+            next_lsn = flushed_lsn;
+        }
+
+        // Create tailing cursor
+        let mut cursors = self.cursors.lock().unwrap();
+        let context_id = cursors.create_oplog_cursor(wal_path, next_lsn, filter_collection);
+
+        let mut reply = MsgOpReply::ok(header.opcode, header.request_id, docs);
+        reply.context_id = context_id;
+        reply
     }
 
     // ── Replication message handlers ────────────────────────────────
