@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use clap::Parser;
 use sdb_common::config::{NodeConfig, NodeRole};
+use sdb_common::NodeAddress;
 use sdb_dps::WriteAheadLog;
 use tracing_subscriber::EnvFilter;
 
@@ -44,6 +45,18 @@ struct Cli {
     /// Data node addresses (host:port) for coordinator mode (repeatable)
     #[arg(long)]
     data_addr: Vec<String>,
+
+    /// Replica group ID
+    #[arg(long, default_value_t = 1)]
+    group_id: u32,
+
+    /// Node ID within the replica group
+    #[arg(long, default_value_t = 1)]
+    node_id: u16,
+
+    /// Replica peer address (host:port), repeatable
+    #[arg(long)]
+    repl_peer: Vec<String>,
 }
 
 fn parse_role(s: &str) -> NodeRole {
@@ -87,6 +100,12 @@ fn main() {
     }
     if !cli.data_addr.is_empty() {
         config.data_addrs = cli.data_addr;
+    }
+    config.group_id = cli.group_id;
+    config.node_id = cli.node_id;
+    if !cli.repl_peer.is_empty() {
+        config.repl_peers = cli.repl_peer;
+        config.repl_enabled = true;
     }
 
     tracing::info!(
@@ -175,7 +194,54 @@ async fn start_data(config: &NodeConfig) {
     };
 
     let wal = Arc::new(Mutex::new(wal));
-    let handler = Arc::new(DataNodeHandler::new_with_wal(catalog.clone(), wal));
+
+    let handler: Arc<DataNodeHandler> = if config.repl_enabled && !config.repl_peers.is_empty() {
+        let local_node = NodeAddress {
+            group_id: config.group_id,
+            node_id: config.node_id,
+        };
+
+        // Parse peer addresses: each is "node_id@host:port" or just "host:port"
+        let mut peers = Vec::new();
+        for (i, peer_str) in config.repl_peers.iter().enumerate() {
+            let (nid, addr) = if let Some(at_pos) = peer_str.find('@') {
+                let nid: u16 = peer_str[..at_pos].parse().unwrap_or((i + 2) as u16);
+                (nid, peer_str[at_pos + 1..].to_string())
+            } else {
+                ((i + 2) as u16, peer_str.clone())
+            };
+            let peer_node = NodeAddress {
+                group_id: config.group_id,
+                node_id: nid,
+            };
+            peers.push((peer_node, addr));
+        }
+
+        tracing::info!(
+            group_id = config.group_id,
+            node_id = config.node_id,
+            peers = config.repl_peers.len(),
+            "Starting data node with replication"
+        );
+
+        let handler = Arc::new(DataNodeHandler::new_with_replication(
+            catalog.clone(),
+            wal,
+            local_node,
+            peers,
+            wal_path,
+        ));
+
+        // Spawn election loop
+        let handler_clone = handler.clone();
+        tokio::spawn(async move {
+            handler_clone.run_election_loop().await;
+        });
+
+        handler
+    } else {
+        Arc::new(DataNodeHandler::new_with_wal(catalog.clone(), wal))
+    };
 
     let mut frame = sdb_net::NetFrame::new(format!("{}:{}", config.host, config.port));
     frame.set_handler(handler);

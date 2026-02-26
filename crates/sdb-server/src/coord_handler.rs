@@ -118,6 +118,11 @@ impl CoordNodeHandler {
                 Ok(docs) => return MsgOpReply::ok(header.opcode, header.request_id, docs),
                 Err(e) => Err(e),
             },
+            "$enable sharding" => self.cmd_enable_sharding(query),
+            "$get shard info" => match self.cmd_get_shard_info(query) {
+                Ok(docs) => return MsgOpReply::ok(header.opcode, header.request_id, docs),
+                Err(e) => Err(e),
+            },
             _ => Err(SdbError::InvalidArg),
         };
         match result {
@@ -461,6 +466,44 @@ impl CoordNodeHandler {
             }
         }
         MsgOpReply::ok(header.opcode, header.request_id, vec![])
+    }
+
+    // ── Shard management ──────────────────────────────────────────────
+
+    fn cmd_enable_sharding(&self, query: &MsgOpQuery) -> Result<()> {
+        let cond = query.condition.as_ref().ok_or(SdbError::InvalidArg)?;
+        let collection = match cond.get("Collection") {
+            Some(Value::String(s)) => s.clone(),
+            _ => return Err(SdbError::InvalidArg),
+        };
+        let shard_key = match cond.get("ShardKey") {
+            Some(Value::String(s)) => s.clone(),
+            _ => return Err(SdbError::InvalidArg),
+        };
+        let num_groups = match cond.get("NumGroups") {
+            Some(Value::Int32(n)) => *n as u32,
+            Some(Value::Int64(n)) => *n as u32,
+            _ => self.clients.len() as u32,
+        };
+        self.set_shard(&collection, &shard_key, num_groups)
+    }
+
+    fn cmd_get_shard_info(&self, query: &MsgOpQuery) -> Result<Vec<Document>> {
+        let cond = query.condition.as_ref().ok_or(SdbError::InvalidArg)?;
+        let collection = match cond.get("Collection") {
+            Some(Value::String(s)) => s.clone(),
+            _ => return Err(SdbError::InvalidArg),
+        };
+        let router = self.router.read().map_err(|_| SdbError::Sys)?;
+        let mut result = Document::new();
+        if let Some((shard_key, num_groups)) = router.shard_info(&collection) {
+            result.insert("Sharded", Value::Boolean(true));
+            result.insert("ShardKey", Value::String(shard_key));
+            result.insert("NumGroups", Value::Int32(num_groups as i32));
+        } else {
+            result.insert("Sharded", Value::Boolean(false));
+        }
+        Ok(vec![result])
     }
 
     // ── Count ───────────────────────────────────────────────────────

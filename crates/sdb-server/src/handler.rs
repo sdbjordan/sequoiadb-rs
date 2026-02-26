@@ -7,7 +7,9 @@ use sdb_aggr::{Pipeline, Stage, StageType};
 use sdb_auth::AuthManager;
 use sdb_bson::{Document, Value};
 use sdb_cat::CatalogManager;
-use sdb_common::{RecordId, Result, SdbError};
+use sdb_cls::election::{ElectionManager, ElectionState};
+use sdb_cls::ReplicationAgent;
+use sdb_common::{NodeAddress, RecordId, Result, SdbError};
 use sdb_dps::{LogOp, LogRecord, WriteAheadLog};
 use sdb_mon::{Metrics, Snapshot, SnapshotType};
 use sdb_mth::{Matcher, Modifier};
@@ -48,6 +50,9 @@ pub struct DataNodeHandler {
     txn_mgr: Arc<StdMutex<TransactionManager>>,
     txn_buffers: Arc<StdMutex<HashMap<SocketAddr, TxnBuffer>>>,
     metrics: Arc<Metrics>,
+    election: Option<Arc<StdMutex<ElectionManager>>>,
+    repl_agent: Option<Arc<tokio::sync::Mutex<ReplicationAgent>>>,
+    wal_path: Option<String>,
 }
 
 impl DataNodeHandler {
@@ -61,6 +66,9 @@ impl DataNodeHandler {
             txn_mgr: Arc::new(StdMutex::new(TransactionManager::new())),
             txn_buffers: Arc::new(StdMutex::new(HashMap::new())),
             metrics: Arc::new(Metrics::new()),
+            election: None,
+            repl_agent: None,
+            wal_path: None,
         }
     }
 
@@ -77,6 +85,9 @@ impl DataNodeHandler {
             txn_mgr: Arc::new(StdMutex::new(TransactionManager::new())),
             txn_buffers: Arc::new(StdMutex::new(HashMap::new())),
             metrics: Arc::new(Metrics::new()),
+            election: None,
+            repl_agent: None,
+            wal_path: None,
         }
     }
 
@@ -93,7 +104,67 @@ impl DataNodeHandler {
             txn_mgr: Arc::new(StdMutex::new(TransactionManager::new())),
             txn_buffers: Arc::new(StdMutex::new(HashMap::new())),
             metrics: Arc::new(Metrics::new()),
+            election: None,
+            repl_agent: None,
+            wal_path: None,
         }
+    }
+
+    /// Create a handler with WAL + replication support.
+    pub fn new_with_replication(
+        catalog: Arc<RwLock<CatalogManager>>,
+        wal: Arc<Mutex<WriteAheadLog>>,
+        local_node: NodeAddress,
+        peers: Vec<(NodeAddress, String)>,
+        wal_path: String,
+    ) -> Self {
+        let mut em = ElectionManager::new(local_node);
+        let mut agent = ReplicationAgent::new(local_node);
+
+        for (peer_addr, tcp_addr) in &peers {
+            em.add_peer(*peer_addr);
+            agent.add_replica(*peer_addr);
+            agent.peer_addrs.insert(peer_addr.node_id, tcp_addr.clone());
+        }
+
+        // Add jitter based on node_id to reduce split votes
+        let jitter_ms = local_node.node_id as u64 * 200;
+        em.heartbeat_timeout =
+            std::time::Duration::from_millis(3000 + jitter_ms);
+
+        Self {
+            catalog,
+            auth: Arc::new(RwLock::new(AuthManager::new())),
+            cursors: Arc::new(StdMutex::new(CursorManager::new())),
+            wal: Some(wal),
+            sessions: Arc::new(StdMutex::new(HashMap::new())),
+            txn_mgr: Arc::new(StdMutex::new(TransactionManager::new())),
+            txn_buffers: Arc::new(StdMutex::new(HashMap::new())),
+            metrics: Arc::new(Metrics::new()),
+            election: Some(Arc::new(StdMutex::new(em))),
+            repl_agent: Some(Arc::new(tokio::sync::Mutex::new(agent))),
+            wal_path: Some(wal_path),
+        }
+    }
+
+    /// Check if this node is primary (or if replication is not enabled, always Ok).
+    pub fn check_primary(&self) -> Result<()> {
+        match &self.election {
+            None => Ok(()),
+            Some(em) => {
+                let em = em.lock().unwrap_or_else(|e| e.into_inner());
+                if em.is_primary() {
+                    Ok(())
+                } else {
+                    Err(SdbError::NotPrimary)
+                }
+            }
+        }
+    }
+
+    /// Get the election manager (for tests).
+    pub fn election(&self) -> &Option<Arc<StdMutex<ElectionManager>>> {
+        &self.election
     }
 
     /// Get a reference to the metrics for snapshot queries.
@@ -469,6 +540,11 @@ impl DataNodeHandler {
     // ── DML handlers ────────────────────────────────────────────────
 
     fn handle_insert(&self, header: &MsgHeader, payload: &[u8], addr: &SocketAddr) -> MsgOpReply {
+        // Reject writes on secondary
+        if let Err(e) = self.check_primary() {
+            return MsgOpReply::error(header.opcode, header.request_id, &e);
+        }
+
         let msg = match MsgOpInsert::decode(header, payload) {
             Ok(m) => m,
             Err(e) => return MsgOpReply::error(header.opcode, header.request_id, &e),
@@ -522,6 +598,9 @@ impl DataNodeHandler {
     }
 
     fn handle_update(&self, header: &MsgHeader, payload: &[u8], addr: &SocketAddr) -> MsgOpReply {
+        if let Err(e) = self.check_primary() {
+            return MsgOpReply::error(header.opcode, header.request_id, &e);
+        }
         let msg = match MsgOpUpdate::decode(header, payload) {
             Ok(m) => m,
             Err(e) => return MsgOpReply::error(header.opcode, header.request_id, &e),
@@ -596,6 +675,9 @@ impl DataNodeHandler {
     }
 
     fn handle_delete(&self, header: &MsgHeader, payload: &[u8], addr: &SocketAddr) -> MsgOpReply {
+        if let Err(e) = self.check_primary() {
+            return MsgOpReply::error(header.opcode, header.request_id, &e);
+        }
         let msg = match MsgOpDelete::decode(header, payload) {
             Ok(m) => m,
             Err(e) => return MsgOpReply::error(header.opcode, header.request_id, &e),
@@ -1129,6 +1211,303 @@ impl DataNodeHandler {
             _ => Err(SdbError::InvalidArg),
         }
     }
+    // ── Replication message handlers ────────────────────────────────
+
+    fn handle_repl_sync(&self, header: &MsgHeader, payload: &[u8]) -> MsgOpReply {
+        if payload.len() < 4 {
+            return MsgOpReply::error(header.opcode, header.request_id, &SdbError::InvalidArg);
+        }
+
+        let num_records = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
+        let mut offset = 4;
+        let mut last_lsn: u64 = 0;
+
+        for _ in 0..num_records {
+            if offset + 4 > payload.len() {
+                break;
+            }
+            let frame_len =
+                u32::from_le_bytes(payload[offset..offset + 4].try_into().unwrap()) as usize;
+            offset += 4;
+            if offset + frame_len > payload.len() {
+                break;
+            }
+            let frame_bytes = &payload[offset..offset + frame_len];
+            offset += frame_len;
+
+            // Decode frame as BSON doc
+            if let Ok(doc) = Document::from_bytes(frame_bytes) {
+                let lsn = match doc.get("lsn") {
+                    Some(Value::Int64(n)) => *n as u64,
+                    _ => continue,
+                };
+                last_lsn = lsn;
+
+                // Extract the original WAL data and replay it
+                let data = match doc.get("data") {
+                    Some(Value::Binary(b)) => b.clone(),
+                    _ => continue,
+                };
+
+                // Parse the WAL data as a BSON doc for replay
+                if let Ok(wal_doc) = Document::from_bytes(&data) {
+                    let op_str = match wal_doc.get("op") {
+                        Some(Value::String(s)) => s.clone(),
+                        _ => continue,
+                    };
+
+                    let mut catalog = match self.catalog.write() {
+                        Ok(c) => c,
+                        Err(_) => continue,
+                    };
+
+                    let _ = match op_str.as_str() {
+                        "CCS" => replay_create_cs(&mut catalog, &wal_doc),
+                        "DCS" => replay_drop_cs(&mut catalog, &wal_doc),
+                        "CCL" => replay_create_cl(&mut catalog, &wal_doc),
+                        "DCL" => replay_drop_cl(&mut catalog, &wal_doc),
+                        "CIX" => replay_create_index(&mut catalog, &wal_doc),
+                        "DIX" => replay_drop_index(&mut catalog, &wal_doc),
+                        "I" => replay_insert(&mut catalog, &wal_doc),
+                        "D" => replay_delete(&catalog, &wal_doc),
+                        "U" => replay_update(&catalog, &wal_doc),
+                        _ => Ok(()),
+                    };
+                }
+
+                // Also append to local WAL
+                if let Some(ref wal) = self.wal {
+                    if let Ok(mut wal) = wal.lock() {
+                        let op_code = match doc.get("op") {
+                            Some(Value::Int32(n)) => *n,
+                            _ => 0,
+                        };
+                        let mut record = LogRecord {
+                            lsn: 0,
+                            prev_lsn: 0,
+                            txn_id: 0,
+                            op: log_op_from_i32(op_code),
+                            data,
+                        };
+                        let _ = wal.append(&mut record);
+                        let _ = wal.flush();
+                    }
+                }
+            }
+        }
+
+        // Return ack with last_lsn
+        let mut ack_doc = Document::new();
+        ack_doc.insert("acked_lsn", Value::Int64(last_lsn as i64));
+        MsgOpReply::ok(header.opcode, header.request_id, vec![ack_doc])
+    }
+
+    fn handle_repl_vote_req(&self, header: &MsgHeader, payload: &[u8]) -> MsgOpReply {
+        let em = match &self.election {
+            Some(em) => em,
+            None => return MsgOpReply::error(header.opcode, header.request_id, &SdbError::InvalidArg),
+        };
+
+        // Decode BSON payload
+        let doc = match Document::from_bytes(payload) {
+            Ok(d) => d,
+            Err(_) => return MsgOpReply::error(header.opcode, header.request_id, &SdbError::InvalidBson),
+        };
+
+        let term = match doc.get("term") {
+            Some(Value::Int64(n)) => *n as u64,
+            _ => return MsgOpReply::error(header.opcode, header.request_id, &SdbError::InvalidArg),
+        };
+        let candidate_id = match doc.get("candidate_id") {
+            Some(Value::Int32(n)) => *n as u16,
+            _ => return MsgOpReply::error(header.opcode, header.request_id, &SdbError::InvalidArg),
+        };
+        let last_lsn = match doc.get("last_lsn") {
+            Some(Value::Int64(n)) => *n as u64,
+            _ => 0,
+        };
+
+        let mut em = em.lock().unwrap_or_else(|e| e.into_inner());
+        let granted = em.should_grant_vote(candidate_id, term, last_lsn);
+
+        let mut reply_doc = Document::new();
+        reply_doc.insert("term", Value::Int64(em.term as i64));
+        reply_doc.insert("voter_id", Value::Int32(em.local_node.node_id as i32));
+        reply_doc.insert("granted", Value::Boolean(granted));
+        MsgOpReply::ok(header.opcode, header.request_id, vec![reply_doc])
+    }
+
+    fn handle_repl_heartbeat(&self, header: &MsgHeader, payload: &[u8]) -> MsgOpReply {
+        let em = match &self.election {
+            Some(em) => em,
+            None => return MsgOpReply::error(header.opcode, header.request_id, &SdbError::InvalidArg),
+        };
+
+        let doc = match Document::from_bytes(payload) {
+            Ok(d) => d,
+            Err(_) => return MsgOpReply::error(header.opcode, header.request_id, &SdbError::InvalidBson),
+        };
+
+        let term = match doc.get("term") {
+            Some(Value::Int64(n)) => *n as u64,
+            _ => return MsgOpReply::error(header.opcode, header.request_id, &SdbError::InvalidArg),
+        };
+        let primary_id = match doc.get("primary_id") {
+            Some(Value::Int32(n)) => *n as u16,
+            _ => return MsgOpReply::error(header.opcode, header.request_id, &SdbError::InvalidArg),
+        };
+
+        let mut em = em.lock().unwrap_or_else(|e| e.into_inner());
+        em.heartbeat_received(primary_id, term);
+
+        MsgOpReply::ok(header.opcode, header.request_id, vec![])
+    }
+
+    // ── Election background loop ────────────────────────────────────
+
+    /// Run the election loop as a background task.
+    /// Checks heartbeat timeout, triggers elections, and sends heartbeats if primary.
+    pub async fn run_election_loop(self: Arc<Self>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+            let em = match &self.election {
+                Some(em) => em.clone(),
+                None => return,
+            };
+            let agent = match &self.repl_agent {
+                Some(a) => a.clone(),
+                None => return,
+            };
+
+            let (should_elect, is_primary, _term, node_id, peers, local_lsn) = {
+                let em = em.lock().unwrap_or_else(|e| e.into_inner());
+                let should = em.state != ElectionState::Primary
+                    && em.is_heartbeat_timed_out();
+                let peers: Vec<(u16, String)> = {
+                    let ag = agent.try_lock();
+                    match ag {
+                        Ok(ag) => ag.peer_addrs.iter().map(|(id, addr)| (*id, addr.clone())).collect(),
+                        Err(_) => vec![],
+                    }
+                };
+                (should, em.is_primary(), em.term, em.local_node.node_id, peers, em.local_lsn)
+            };
+
+            if should_elect && !peers.is_empty() {
+                // Start election
+                {
+                    let mut em = em.lock().unwrap_or_else(|e| e.into_inner());
+                    let _ = em.start_election();
+                }
+                let current_term = {
+                    let em = em.lock().unwrap_or_else(|e| e.into_inner());
+                    em.term
+                };
+
+                // Send VoteReq to all peers
+                for (peer_id, addr) in &peers {
+                    let mut vote_doc = Document::new();
+                    vote_doc.insert("term", Value::Int64(current_term as i64));
+                    vote_doc.insert("candidate_id", Value::Int32(node_id as i32));
+                    vote_doc.insert("last_lsn", Value::Int64(local_lsn as i64));
+
+                    if let Ok(payload) = vote_doc.to_bytes() {
+                        let mut header = MsgHeader::new_request(OpCode::ReplVoteReq as i32, 0);
+                        header.msg_len = (MsgHeader::SIZE + payload.len()) as i32;
+                        let mut msg = Vec::new();
+                        header.encode(&mut msg);
+                        msg.extend_from_slice(&payload);
+
+                        if let Ok(mut stream) = TcpStream::connect(addr).await {
+                            if stream.write_all(&msg).await.is_ok() {
+                                let _ = stream.flush().await;
+                                // Read reply
+                                let mut len_buf = [0u8; 4];
+                                if stream.read_exact(&mut len_buf).await.is_ok() {
+                                    let reply_len = i32::from_le_bytes(len_buf) as usize;
+                                    if (MsgHeader::SIZE..65536).contains(&reply_len) {
+                                        let mut reply_buf = vec![0u8; reply_len];
+                                        reply_buf[..4].copy_from_slice(&len_buf);
+                                        if stream.read_exact(&mut reply_buf[4..]).await.is_ok() {
+                                            if let Ok(reply_header) = MsgHeader::decode(&reply_buf) {
+                                                let reply_payload = &reply_buf[MsgHeader::SIZE..];
+                                                if let Ok(reply) = sdb_msg::reply::MsgOpReply::decode(&reply_header, reply_payload) {
+                                                    if let Some(doc) = reply.docs.first() {
+                                                        let granted = matches!(doc.get("granted"), Some(Value::Boolean(true)));
+                                                        if granted {
+                                                            let mut em = em.lock().unwrap_or_else(|e| e.into_inner());
+                                                            let _ = em.receive_vote(*peer_id);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if is_primary {
+                // Send heartbeat to all peers
+                let current_term = {
+                    let em = em.lock().unwrap_or_else(|e| e.into_inner());
+                    em.term
+                };
+
+                for (_peer_id, addr) in &peers {
+                    let mut hb_doc = Document::new();
+                    hb_doc.insert("term", Value::Int64(current_term as i64));
+                    hb_doc.insert("primary_id", Value::Int32(node_id as i32));
+                    hb_doc.insert("commit_lsn", Value::Int64(0));
+
+                    if let Ok(payload) = hb_doc.to_bytes() {
+                        let mut header = MsgHeader::new_request(OpCode::ReplHeartbeat as i32, 0);
+                        header.msg_len = (MsgHeader::SIZE + payload.len()) as i32;
+                        let mut msg = Vec::new();
+                        header.encode(&mut msg);
+                        msg.extend_from_slice(&payload);
+
+                        if let Ok(mut stream) = TcpStream::connect(addr).await {
+                            let _ = stream.write_all(&msg).await;
+                            let _ = stream.flush().await;
+                            // Read and discard ack
+                            let mut len_buf = [0u8; 4];
+                            if stream.read_exact(&mut len_buf).await.is_ok() {
+                                let rl = i32::from_le_bytes(len_buf) as usize;
+                                if (MsgHeader::SIZE..65536).contains(&rl) {
+                                    let mut buf = vec![0u8; rl - 4];
+                                    let _ = stream.read_exact(&mut buf).await;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn log_op_from_i32(v: i32) -> LogOp {
+    match v {
+        0 => LogOp::Insert,
+        1 => LogOp::Update,
+        2 => LogOp::Delete,
+        3 => LogOp::TxnBegin,
+        4 => LogOp::TxnCommit,
+        5 => LogOp::TxnAbort,
+        6 => LogOp::CollectionCreate,
+        7 => LogOp::CollectionDrop,
+        8 => LogOp::IndexCreate,
+        9 => LogOp::IndexDrop,
+        _ => LogOp::Insert,
+    }
 }
 
 #[async_trait]
@@ -1175,6 +1554,13 @@ impl MessageHandler for DataNodeHandler {
             Some(OpCode::TransCommitReq) => self.handle_trans_commit(&header, &addr),
             Some(OpCode::TransRollbackReq) => self.handle_trans_rollback(&header, &addr),
             Some(OpCode::Disconnect) => return Err(SdbError::NetworkClose),
+            Some(OpCode::ReplSync) => self.handle_repl_sync(&header, payload),
+            Some(OpCode::ReplVoteReq) => self.handle_repl_vote_req(&header, payload),
+            Some(OpCode::ReplVoteReply) => {
+                // VoteReply is handled inline in election loop, not here
+                MsgOpReply::ok(header.opcode, header.request_id, vec![])
+            }
+            Some(OpCode::ReplHeartbeat) => self.handle_repl_heartbeat(&header, payload),
             _ => MsgOpReply::error(header.opcode, header.request_id, &SdbError::InvalidArg),
         };
 

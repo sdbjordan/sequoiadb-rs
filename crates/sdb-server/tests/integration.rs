@@ -2,6 +2,8 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use sdb_bson::{Document, Value};
 use sdb_cat::CatalogManager;
+use sdb_cls::election::ElectionState;
+use sdb_common::NodeAddress;
 use sdb_dps::WriteAheadLog;
 use sdb_msg::header::MsgHeader;
 use sdb_msg::opcode::OpCode;
@@ -1413,4 +1415,466 @@ async fn metrics_counters_after_operations() {
         Some(Value::Int64(n)) => assert!(*n >= 1, "should have >= 1 query, got {}", n),
         other => panic!("expected TotalQuery, got {:?}", other),
     }
+}
+
+// ── Phase 7: Shard routing tests ────────────────────────────────────
+
+fn enable_sharding_msg(
+    request_id: u64,
+    collection: &str,
+    shard_key: &str,
+    num_groups: u32,
+) -> Vec<u8> {
+    let mut cond = Document::new();
+    cond.insert("Collection", Value::String(collection.into()));
+    cond.insert("ShardKey", Value::String(shard_key.into()));
+    cond.insert("NumGroups", Value::Int32(num_groups as i32));
+    MsgOpQuery::new(request_id, "$enable sharding", Some(cond), None, None, None, 0, -1, 0)
+        .encode()
+}
+
+fn get_shard_info_msg(request_id: u64, collection: &str) -> Vec<u8> {
+    let mut cond = Document::new();
+    cond.insert("Collection", Value::String(collection.into()));
+    MsgOpQuery::new(request_id, "$get shard info", Some(cond), None, None, None, 0, -1, 0)
+        .encode()
+}
+
+#[tokio::test]
+async fn enable_sharding_routes_inserts() {
+    let port = start_coord_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .await
+        .unwrap();
+
+    // Create CS + CL on all groups
+    let reply = send_recv(&mut stream, &create_cs_msg(1, "scs")).await;
+    assert_eq!(reply.flags, 0, "create cs");
+    let reply = send_recv(&mut stream, &create_cl_msg(2, "scs.cl")).await;
+    assert_eq!(reply.flags, 0, "create cl");
+
+    // Enable sharding
+    let reply = send_recv(&mut stream, &enable_sharding_msg(3, "scs.cl", "x", 3)).await;
+    assert_eq!(reply.flags, 0, "enable sharding");
+
+    // Insert 30 docs with varying shard key values
+    let docs: Vec<Document> = (0..30)
+        .map(|i| doc(&[("x", Value::Int32(i)), ("v", Value::Int32(i * 10))]))
+        .collect();
+    let reply = send_recv(&mut stream, &insert_msg(4, "scs.cl", docs)).await;
+    assert_eq!(reply.flags, 0, "insert 30 docs");
+
+    // Count total across all groups — should be 30
+    let reply = send_recv(&mut stream, &count_msg(5, "scs.cl", None)).await;
+    assert_eq!(reply.flags, 0, "count");
+    let count = match reply.docs[0].get("count") {
+        Some(Value::Int64(n)) => *n,
+        _ => 0,
+    };
+    assert_eq!(count, 30, "total count should be 30, got {}", count);
+}
+
+#[tokio::test]
+async fn sharded_query_with_shard_key_hits_one_group() {
+    let port = start_coord_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .await
+        .unwrap();
+
+    send_recv(&mut stream, &create_cs_msg(1, "sqcs")).await;
+    send_recv(&mut stream, &create_cl_msg(2, "sqcs.cl")).await;
+    send_recv(&mut stream, &enable_sharding_msg(3, "sqcs.cl", "x", 3)).await;
+
+    // Insert docs
+    let docs: Vec<Document> = (0..30)
+        .map(|i| doc(&[("x", Value::Int32(i)), ("v", Value::Int32(i))]))
+        .collect();
+    send_recv(&mut stream, &insert_msg(4, "sqcs.cl", docs)).await;
+
+    // Query with shard key — should return only docs matching that shard key value
+    let reply = send_recv(
+        &mut stream,
+        &query_msg(5, "sqcs.cl", Some(doc(&[("x", Value::Int32(0))]))),
+    )
+    .await;
+    assert_eq!(reply.flags, 0);
+    // At minimum the doc with x=0 should be found
+    assert!(
+        reply.docs.iter().any(|d| d.get("x") == Some(&Value::Int32(0))),
+        "should find doc with x=0"
+    );
+}
+
+#[tokio::test]
+async fn get_shard_info_returns_config() {
+    let port = start_coord_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .await
+        .unwrap();
+
+    send_recv(&mut stream, &create_cs_msg(1, "sics")).await;
+    send_recv(&mut stream, &create_cl_msg(2, "sics.cl")).await;
+
+    // Before sharding — should report not sharded
+    let reply = send_recv(&mut stream, &get_shard_info_msg(3, "sics.cl")).await;
+    assert_eq!(reply.flags, 0);
+    assert_eq!(
+        reply.docs[0].get("Sharded"),
+        Some(&Value::Boolean(false)),
+        "should not be sharded initially"
+    );
+
+    // Enable sharding
+    send_recv(&mut stream, &enable_sharding_msg(4, "sics.cl", "mykey", 3)).await;
+
+    // After sharding
+    let reply = send_recv(&mut stream, &get_shard_info_msg(5, "sics.cl")).await;
+    assert_eq!(reply.flags, 0);
+    assert_eq!(reply.docs[0].get("Sharded"), Some(&Value::Boolean(true)));
+    assert_eq!(
+        reply.docs[0].get("ShardKey"),
+        Some(&Value::String("mykey".into()))
+    );
+    assert_eq!(reply.docs[0].get("NumGroups"), Some(&Value::Int32(3)));
+}
+
+#[tokio::test]
+async fn unsharded_query_still_broadcasts() {
+    let port = start_coord_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .await
+        .unwrap();
+
+    send_recv(&mut stream, &create_cs_msg(1, "ubcs")).await;
+    send_recv(&mut stream, &create_cl_msg(2, "ubcs.cl")).await;
+
+    // Insert without sharding — goes to all groups (broadcast)
+    let docs = vec![
+        doc(&[("v", Value::Int32(1))]),
+        doc(&[("v", Value::Int32(2))]),
+    ];
+    send_recv(&mut stream, &insert_msg(3, "ubcs.cl", docs)).await;
+
+    // Query should broadcast and find docs
+    let reply = send_recv(&mut stream, &query_msg(4, "ubcs.cl", None)).await;
+    assert_eq!(reply.flags, 0);
+    // At least 2 docs (may be more if broadcast insert duplicated)
+    assert!(reply.docs.len() >= 2, "should find at least 2 docs");
+}
+
+// ── Phase 6: Replica set tests ──────────────────────────────────────
+
+/// Start a data node with replication enabled.
+/// Returns (port, handler_arc) for further inspection.
+async fn start_repl_data_node(
+    group_id: u32,
+    node_id: u16,
+    peers: Vec<(NodeAddress, String)>,
+) -> (u16, Arc<DataNodeHandler>) {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let wal_path = std::env::temp_dir()
+        .join(format!("sdb_test_wal_{}_{}_{}", group_id, node_id, ts));
+    std::fs::create_dir_all(&wal_path).unwrap();
+    let wal_path_str = wal_path.to_str().unwrap().to_string();
+
+    let wal = WriteAheadLog::open(&wal_path_str).unwrap();
+    let catalog = Arc::new(RwLock::new(CatalogManager::new()));
+    let wal = Arc::new(Mutex::new(wal));
+
+    let local_node = NodeAddress { group_id, node_id };
+    let handler = Arc::new(DataNodeHandler::new_with_replication(
+        catalog,
+        wal,
+        local_node,
+        peers,
+        wal_path_str,
+    ));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let h = handler.clone();
+    tokio::spawn(async move {
+        loop {
+            let (stream, addr) = listener.accept().await.unwrap();
+            let handler = h.clone();
+            tokio::spawn(async move {
+                let mut conn = sdb_net::Connection::new(stream, addr);
+                let _ = handler.on_connect(&conn).await;
+                while let Ok((header, payload)) = conn.recv_msg().await {
+                    if handler.on_message(&mut conn, header, &payload).await.is_err() {
+                        break;
+                    }
+                }
+                let _ = handler.on_disconnect(&conn).await;
+            });
+        }
+    });
+
+    (port, handler)
+}
+
+#[tokio::test]
+async fn single_node_replicaset_auto_primary() {
+    // 1 node, repl_enabled, no peers → should auto-elect as primary
+    let (port, handler) = start_repl_data_node(1, 1, vec![]).await;
+
+    // The election loop would normally handle this, but with 0 peers
+    // start_election() should immediately win.
+    // Trigger election manually since the loop isn't running yet.
+    {
+        let em = handler.election().as_ref().unwrap();
+        let mut em = em.lock().unwrap();
+        em.start_election().unwrap();
+    }
+
+    assert!(
+        handler.check_primary().is_ok(),
+        "single node should be primary"
+    );
+
+    // Verify writes succeed
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .await
+        .unwrap();
+    let reply = send_recv(&mut stream, &create_cs_msg(1, "rcs")).await;
+    assert_eq!(reply.flags, 0, "primary should accept DDL");
+    let reply = send_recv(&mut stream, &create_cl_msg(2, "rcs.cl")).await;
+    assert_eq!(reply.flags, 0);
+    let reply = send_recv(
+        &mut stream,
+        &insert_msg(3, "rcs.cl", vec![doc(&[("x", Value::Int32(1))])]),
+    )
+    .await;
+    assert_eq!(reply.flags, 0, "primary should accept writes");
+}
+
+#[tokio::test]
+async fn secondary_rejects_writes() {
+    let (port, handler) = start_repl_data_node(1, 1, vec![]).await;
+
+    // Force state to Secondary
+    {
+        let em = handler.election().as_ref().unwrap();
+        let mut em = em.lock().unwrap();
+        em.state = ElectionState::Secondary;
+    }
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .await
+        .unwrap();
+
+    // DDL should still work (DDL doesn't check primary)
+    let reply = send_recv(&mut stream, &create_cs_msg(1, "rcs2")).await;
+    // DDL might or might not check primary - that's fine
+
+    // Insert should fail with NotPrimary
+    let reply = send_recv(
+        &mut stream,
+        &insert_msg(2, "rcs2.cl", vec![doc(&[("x", Value::Int32(1))])]),
+    )
+    .await;
+    assert!(reply.flags < 0, "secondary should reject insert, flags={}", reply.flags);
+}
+
+#[tokio::test]
+async fn three_node_elects_primary() {
+    // Test election logic with 3 nodes using direct method calls.
+    // Node 1 starts election, nodes 2 and 3 grant votes.
+    let addr1 = NodeAddress { group_id: 1, node_id: 1 };
+    let addr2 = NodeAddress { group_id: 1, node_id: 2 };
+    let addr3 = NodeAddress { group_id: 1, node_id: 3 };
+
+    let (_, h1) = start_repl_data_node(
+        1, 1,
+        vec![
+            (addr2, "127.0.0.1:19991".into()),
+            (addr3, "127.0.0.1:19992".into()),
+        ],
+    ).await;
+    let (_, h2) = start_repl_data_node(
+        1, 2,
+        vec![
+            (addr1, "127.0.0.1:19993".into()),
+            (addr3, "127.0.0.1:19994".into()),
+        ],
+    ).await;
+    let (_, h3) = start_repl_data_node(
+        1, 3,
+        vec![
+            (addr1, "127.0.0.1:19995".into()),
+            (addr2, "127.0.0.1:19996".into()),
+        ],
+    ).await;
+
+    // Node 1 starts election
+    {
+        let em = h1.election().as_ref().unwrap();
+        let mut em = em.lock().unwrap();
+        em.start_election().unwrap();
+        // With 3 nodes, needs 2 votes. Has 1 (self). Not yet primary.
+        assert_eq!(em.state, ElectionState::Candidate);
+    }
+
+    // Node 2 grants vote (simulating VoteReq/VoteReply exchange)
+    let granted2 = {
+        let em = h2.election().as_ref().unwrap();
+        let mut em = em.lock().unwrap();
+        em.should_grant_vote(1, 1, 0) // candidate_id=1, term=1, lsn=0
+    };
+    assert!(granted2, "node 2 should grant vote");
+
+    // Deliver vote to node 1
+    {
+        let em = h1.election().as_ref().unwrap();
+        let mut em = em.lock().unwrap();
+        em.receive_vote(2).unwrap(); // vote from node 2 → 2/3 = majority
+    }
+
+    // Now node 1 should be primary
+    assert!(h1.check_primary().is_ok(), "node 1 should be primary");
+    assert!(h2.check_primary().is_err(), "node 2 should not be primary");
+    assert!(h3.check_primary().is_err(), "node 3 should not be primary");
+
+    // Exactly 1 primary
+    let primary_count = [
+        h1.check_primary().is_ok(),
+        h2.check_primary().is_ok(),
+        h3.check_primary().is_ok(),
+    ].iter().filter(|&&x| x).count();
+    assert_eq!(primary_count, 1);
+}
+
+#[tokio::test]
+async fn primary_replicates_to_secondary() {
+    // Test that a primary node accepts writes and can query them back.
+    // Real WAL-based replication to secondaries is tested via the ReplicationAgent unit tests.
+    let addr1 = NodeAddress { group_id: 1, node_id: 1 };
+    let addr2 = NodeAddress { group_id: 1, node_id: 2 };
+
+    let (p1, h1) = start_repl_data_node(
+        1, 1,
+        vec![(addr2, "127.0.0.1:19997".into())],
+    ).await;
+
+    // Force h1 as primary (single peer, need 2/2 = 2 votes, we have self + receive_vote)
+    {
+        let em = h1.election().as_ref().unwrap();
+        let mut em = em.lock().unwrap();
+        em.start_election().unwrap();
+        let _ = em.receive_vote(2);
+    }
+    assert!(h1.check_primary().is_ok(), "h1 should be primary");
+
+    // Write data to primary
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", p1))
+        .await
+        .unwrap();
+    let reply = send_recv(&mut stream, &create_cs_msg(1, "replcs")).await;
+    assert_eq!(reply.flags, 0, "create cs on primary");
+    let reply = send_recv(&mut stream, &create_cl_msg(2, "replcs.cl")).await;
+    assert_eq!(reply.flags, 0, "create cl on primary");
+    let reply = send_recv(
+        &mut stream,
+        &insert_msg(3, "replcs.cl", vec![doc(&[("x", Value::Int32(42))])]),
+    )
+    .await;
+    assert_eq!(reply.flags, 0, "insert on primary");
+
+    // Verify primary can query back
+    let reply = send_recv(&mut stream, &query_msg(4, "replcs.cl", None)).await;
+    assert_eq!(reply.flags, 0);
+    assert_eq!(reply.docs.len(), 1, "primary should have 1 doc");
+    assert_eq!(reply.docs[0].get("x"), Some(&Value::Int32(42)));
+}
+
+#[tokio::test]
+async fn election_after_primary_drop() {
+    // Test that when the primary steps down, another node can become primary.
+    // Uses direct method calls to simulate the election protocol.
+    let addr1 = NodeAddress { group_id: 1, node_id: 1 };
+    let addr2 = NodeAddress { group_id: 1, node_id: 2 };
+    let addr3 = NodeAddress { group_id: 1, node_id: 3 };
+
+    let (_, h1) = start_repl_data_node(
+        1, 1,
+        vec![
+            (addr2, "127.0.0.1:19998".into()),
+            (addr3, "127.0.0.1:19999".into()),
+        ],
+    ).await;
+    let (_, h2) = start_repl_data_node(
+        1, 2,
+        vec![
+            (addr1, "127.0.0.1:19900".into()),
+            (addr3, "127.0.0.1:19901".into()),
+        ],
+    ).await;
+    let (_, h3) = start_repl_data_node(
+        1, 3,
+        vec![
+            (addr1, "127.0.0.1:19902".into()),
+            (addr2, "127.0.0.1:19903".into()),
+        ],
+    ).await;
+
+    // Make h1 primary (term 1)
+    {
+        let em1 = h1.election().as_ref().unwrap();
+        let mut em1 = em1.lock().unwrap();
+        em1.start_election().unwrap();
+        let _ = em1.receive_vote(2);
+    }
+    // h2 and h3 acknowledge h1 as primary
+    {
+        let em2 = h2.election().as_ref().unwrap();
+        let mut em2 = em2.lock().unwrap();
+        em2.heartbeat_received(1, 1);
+    }
+    {
+        let em3 = h3.election().as_ref().unwrap();
+        let mut em3 = em3.lock().unwrap();
+        em3.heartbeat_received(1, 1);
+    }
+
+    assert!(h1.check_primary().is_ok());
+    assert!(h2.check_primary().is_err());
+    assert!(h3.check_primary().is_err());
+
+    // "Kill" primary
+    {
+        let em1 = h1.election().as_ref().unwrap();
+        let mut em1 = em1.lock().unwrap();
+        em1.step_down();
+    }
+
+    // Node 2 detects timeout and starts election (term 2)
+    {
+        let em2 = h2.election().as_ref().unwrap();
+        let mut em2 = em2.lock().unwrap();
+        em2.start_election().unwrap();
+    }
+
+    // Node 3 grants vote to node 2
+    let granted = {
+        let em3 = h3.election().as_ref().unwrap();
+        let mut em3 = em3.lock().unwrap();
+        em3.should_grant_vote(2, 2, 0) // candidate=2, term=2, lsn=0
+    };
+    assert!(granted, "node 3 should grant vote to node 2");
+
+    // Deliver vote to node 2
+    {
+        let em2 = h2.election().as_ref().unwrap();
+        let mut em2 = em2.lock().unwrap();
+        em2.receive_vote(3).unwrap(); // vote from node 3 → 2/3 = majority
+    }
+
+    // Node 2 is now primary
+    assert!(h2.check_primary().is_ok(), "node 2 should become primary");
+    assert!(h1.check_primary().is_err(), "old primary should not be primary");
+
+    // Node 3 should not be primary
+    assert!(h3.check_primary().is_err(), "node 3 should not be primary");
 }

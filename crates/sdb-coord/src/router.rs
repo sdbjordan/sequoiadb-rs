@@ -49,6 +49,14 @@ impl CoordRouter {
     pub fn route_delete(&self, collection: &str, condition: Option<&Document>) -> Result<Vec<GroupId>> {
         self.route_query(collection, condition)
     }
+
+    /// Query shard configuration for a collection.
+    /// Returns (shard_key, num_groups) if sharded, None otherwise.
+    pub fn shard_info(&self, collection: &str) -> Option<(String, u32)> {
+        let sm = self.shard_managers.get(collection)?;
+        let key = sm.shard_key.as_ref()?.clone();
+        Some((key, sm.num_groups))
+    }
 }
 
 impl Default for CoordRouter {

@@ -1,4 +1,6 @@
-use sdb_common::{NodeAddress, NodeId, Result, SdbError};
+use std::time::{Duration, Instant};
+
+use sdb_common::{Lsn, NodeAddress, NodeId, Result, SdbError};
 
 /// Election state for a replica group.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,6 +20,10 @@ pub struct ElectionManager {
     pub term: u64,
     pub peers: Vec<NodeAddress>,
     pub votes_received: u32,
+    pub last_heartbeat: Instant,
+    pub heartbeat_timeout: Duration,
+    pub voted_for: Option<NodeId>,
+    pub local_lsn: Lsn,
 }
 
 impl ElectionManager {
@@ -29,6 +35,10 @@ impl ElectionManager {
             term: 0,
             peers: Vec::new(),
             votes_received: 0,
+            last_heartbeat: Instant::now(),
+            heartbeat_timeout: Duration::from_secs(3),
+            voted_for: None,
+            local_lsn: 0,
         }
     }
 
@@ -38,11 +48,12 @@ impl ElectionManager {
     }
 
     /// Start an election. The local node becomes a candidate.
-    /// In v1, if we have a majority (or no peers), we immediately win.
-    pub async fn start_election(&mut self) -> Result<()> {
+    /// If we have a majority (or no peers), we immediately win.
+    pub fn start_election(&mut self) -> Result<()> {
         self.term += 1;
         self.state = ElectionState::Candidate;
         self.votes_received = 1; // vote for self
+        self.voted_for = Some(self.local_node.node_id);
 
         let total = self.peers.len() as u32 + 1; // self + peers
         let majority = total / 2 + 1;
@@ -83,6 +94,52 @@ impl ElectionManager {
         }
     }
 
+    /// Process a heartbeat from the current primary.
+    pub fn heartbeat_received(&mut self, primary_id: NodeId, term: u64) {
+        if term >= self.term {
+            self.term = term;
+            self.state = ElectionState::Secondary;
+            self.primary = Some(primary_id);
+            self.last_heartbeat = Instant::now();
+            self.voted_for = None;
+        }
+    }
+
+    /// Check if the heartbeat timeout has elapsed.
+    pub fn is_heartbeat_timed_out(&self) -> bool {
+        self.last_heartbeat.elapsed() > self.heartbeat_timeout
+    }
+
+    /// Determine whether to grant a vote to the requesting candidate.
+    pub fn should_grant_vote(
+        &mut self,
+        candidate_id: NodeId,
+        candidate_term: u64,
+        candidate_lsn: Lsn,
+    ) -> bool {
+        // Reject if candidate's term is not higher than ours
+        if candidate_term < self.term {
+            return false;
+        }
+        // If candidate has a higher term, update ours and reset voted_for
+        if candidate_term > self.term {
+            self.term = candidate_term;
+            self.voted_for = None;
+            self.state = ElectionState::Secondary;
+        }
+        // Only grant if we haven't voted in this term (or voted for this candidate)
+        if self.voted_for.is_some() && self.voted_for != Some(candidate_id) {
+            return false;
+        }
+        // Candidate's log must be at least as up-to-date as ours
+        if candidate_lsn < self.local_lsn {
+            return false;
+        }
+        self.voted_for = Some(candidate_id);
+        self.last_heartbeat = Instant::now(); // reset timeout
+        true
+    }
+
     pub fn is_primary(&self) -> bool {
         self.state == ElectionState::Primary
     }
@@ -105,24 +162,24 @@ mod tests {
         NodeAddress { group_id: group, node_id: node }
     }
 
-    #[tokio::test]
-    async fn single_node_election() {
+    #[test]
+    fn single_node_election() {
         let mut em = ElectionManager::new(addr(1, 1));
         assert_eq!(em.state, ElectionState::Unknown);
 
-        em.start_election().await.unwrap();
+        em.start_election().unwrap();
         // Single node = majority of 1, should be primary
         assert!(em.is_primary());
         assert_eq!(em.term, 1);
     }
 
-    #[tokio::test]
-    async fn three_node_needs_majority() {
+    #[test]
+    fn three_node_needs_majority() {
         let mut em = ElectionManager::new(addr(1, 1));
         em.add_peer(addr(1, 2));
         em.add_peer(addr(1, 3));
 
-        em.start_election().await.unwrap();
+        em.start_election().unwrap();
         // 1 vote (self) out of 3 — not enough
         assert_eq!(em.state, ElectionState::Candidate);
 

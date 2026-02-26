@@ -23,6 +23,9 @@ pub enum OpCode {
     CatalogReply = 3002,
     ReplSync = 4001,
     ReplConsistency = 4002,
+    ReplVoteReq = 4003,
+    ReplVoteReply = 4004,
+    ReplHeartbeat = 4005,
 }
 
 /// Reply bit flag — OR'd with request opcode to form reply opcode (C++ convention).
@@ -51,6 +54,9 @@ impl OpCode {
             3002 => Some(Self::CatalogReply),
             4001 => Some(Self::ReplSync),
             4002 => Some(Self::ReplConsistency),
+            4003 => Some(Self::ReplVoteReq),
+            4004 => Some(Self::ReplVoteReply),
+            4005 => Some(Self::ReplHeartbeat),
             _ => None,
         }
     }

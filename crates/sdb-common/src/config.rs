@@ -32,7 +32,18 @@ pub struct NodeConfig {
     pub tls_key_path: Option<String>,
     pub tls_ca_path: Option<String>,
     pub monitoring_enabled: bool,
+    #[serde(default = "default_group_id")]
+    pub group_id: u32,
+    #[serde(default = "default_node_id")]
+    pub node_id: u16,
+    #[serde(default)]
+    pub repl_peers: Vec<String>,
+    #[serde(default)]
+    pub repl_enabled: bool,
 }
+
+fn default_group_id() -> u32 { 1 }
+fn default_node_id() -> u16 { 1 }
 
 impl Default for NodeConfig {
     fn default() -> Self {
@@ -56,6 +67,10 @@ impl Default for NodeConfig {
             tls_key_path: None,
             tls_ca_path: None,
             monitoring_enabled: true,
+            group_id: 1,
+            node_id: 1,
+            repl_peers: vec![],
+            repl_enabled: false,
         }
     }
 }
