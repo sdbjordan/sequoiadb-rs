@@ -1,46 +1,56 @@
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex as StdMutex, RwLock};
 
 use async_trait::async_trait;
 use sdb_bson::{Document, Value};
-use sdb_cat::CatalogManager;
 use sdb_cls::ShardManager;
-use sdb_common::{GroupId, RecordId, Result, SdbError};
+use sdb_common::{GroupId, Result, SdbError};
 use sdb_coord::CoordRouter;
-use sdb_mth::{Matcher, Modifier};
+use sdb_mon::Metrics;
 use sdb_msg::header::MsgHeader;
 use sdb_msg::opcode::OpCode;
 use sdb_msg::reply::MsgOpReply;
 use sdb_msg::request::*;
 use sdb_net::Connection;
 use sdb_net::MessageHandler;
-use sdb_opt::Optimizer;
-use sdb_rtn::{CollectionHandle, DefaultExecutor, Executor};
 
 use crate::cursor_manager::CursorManager;
+use crate::data_node_client::DataNodeClient;
 
-/// Coordinator node handler — routes requests across multiple data groups.
-///
-/// V1: in-process routing. Each group has its own CatalogManager.
-/// No real network between coord and data nodes.
+struct CoordTxnState {
+    group_txns: HashMap<GroupId, u64>, // group_id -> txn_id on that data node
+}
+
+/// Coordinator node handler — routes requests across multiple data groups
+/// via real TCP connections to DataNode servers.
 pub struct CoordNodeHandler {
     router: RwLock<CoordRouter>,
-    groups: HashMap<GroupId, Arc<RwLock<CatalogManager>>>,
+    pub(crate) clients: HashMap<GroupId, Arc<DataNodeClient>>,
     cursors: StdMutex<CursorManager>,
+    coord_txns: StdMutex<HashMap<SocketAddr, CoordTxnState>>,
+    metrics: Arc<Metrics>,
 }
 
 impl CoordNodeHandler {
-    /// Create a coordinator with a set of data groups.
-    pub fn new(group_ids: &[GroupId]) -> Self {
-        let mut groups = HashMap::new();
-        for &gid in group_ids {
-            groups.insert(gid, Arc::new(RwLock::new(CatalogManager::new())));
+    /// Create a coordinator with TCP connections to data nodes.
+    /// data_nodes: vec of (group_id, "host:port") pairs.
+    pub fn new(data_nodes: Vec<(GroupId, String)>) -> Self {
+        let mut clients = HashMap::new();
+        for (gid, addr) in data_nodes {
+            clients.insert(gid, Arc::new(DataNodeClient::new(addr)));
         }
         Self {
             router: RwLock::new(CoordRouter::new()),
-            groups,
+            clients,
             cursors: StdMutex::new(CursorManager::new()),
+            coord_txns: StdMutex::new(HashMap::new()),
+            metrics: Arc::new(Metrics::new()),
         }
+    }
+
+    pub fn all_group_ids(&self) -> Vec<GroupId> {
+        self.clients.keys().copied().collect()
     }
 
     /// Register sharding for a collection.
@@ -57,15 +67,6 @@ impl CoordNodeHandler {
         Ok(())
     }
 
-    /// Get a reference to a group's catalog.
-    pub fn group_catalog(&self, group_id: GroupId) -> Result<&Arc<RwLock<CatalogManager>>> {
-        self.groups.get(&group_id).ok_or(SdbError::NodeNotFound)
-    }
-
-    fn all_group_ids(&self) -> Vec<GroupId> {
-        self.groups.keys().copied().collect()
-    }
-
     // ── Query dispatch ──────────────────────────────────────────────
 
     async fn handle_query(&self, header: &MsgHeader, payload: &[u8]) -> MsgOpReply {
@@ -75,109 +76,137 @@ impl CoordNodeHandler {
         };
 
         if query.name.starts_with('$') {
-            self.handle_command(header, &query)
+            self.handle_command(header, &query).await
         } else {
             self.handle_data_query(header, &query).await
         }
     }
 
-    fn handle_command(&self, header: &MsgHeader, query: &MsgOpQuery) -> MsgOpReply {
+    async fn handle_command(&self, header: &MsgHeader, query: &MsgOpQuery) -> MsgOpReply {
         let result = match query.name.as_str() {
-            "$create collectionspace" => self.cmd_broadcast_ddl(|cat| {
-                let name = get_string_field(query.condition.as_ref(), "Name")?;
-                cat.create_collection_space(&name)?;
-                Ok(())
-            }),
-            "$drop collectionspace" => self.cmd_broadcast_ddl(|cat| {
-                let name = get_string_field(query.condition.as_ref(), "Name")?;
-                cat.drop_collection_space(&name)?;
-                Ok(())
-            }),
-            "$create collection" => self.cmd_broadcast_ddl(|cat| {
-                let full_name = get_string_field(query.condition.as_ref(), "Name")?;
-                let (cs, cl) =
-                    full_name.split_once('.').ok_or(SdbError::InvalidArg)?;
-                cat.create_collection(cs, cl)?;
-                Ok(())
-            }),
-            "$drop collection" => self.cmd_broadcast_ddl(|cat| {
-                let full_name = get_string_field(query.condition.as_ref(), "Name")?;
-                let (cs, cl) =
-                    full_name.split_once('.').ok_or(SdbError::InvalidArg)?;
-                cat.drop_collection(cs, cl)?;
-                Ok(())
-            }),
-            "$create index" => self.cmd_broadcast_index_ddl(query, true),
-            "$drop index" => self.cmd_broadcast_index_ddl(query, false),
-            "$count" => self.cmd_count(query),
+            "$create collectionspace" => {
+                let name = get_string_field(query.condition.as_ref(), "Name");
+                match name {
+                    Ok(name) => self.broadcast_create_cs(&name).await,
+                    Err(e) => Err(e),
+                }
+            }
+            "$drop collectionspace" => {
+                let name = get_string_field(query.condition.as_ref(), "Name");
+                match name {
+                    Ok(name) => self.broadcast_drop_cs(&name).await,
+                    Err(e) => Err(e),
+                }
+            }
+            "$create collection" => {
+                let name = get_string_field(query.condition.as_ref(), "Name");
+                match name {
+                    Ok(full_name) => self.broadcast_create_cl(&full_name).await,
+                    Err(e) => Err(e),
+                }
+            }
+            "$drop collection" => {
+                let name = get_string_field(query.condition.as_ref(), "Name");
+                match name {
+                    Ok(full_name) => self.broadcast_drop_cl(&full_name).await,
+                    Err(e) => Err(e),
+                }
+            }
+            "$create index" => self.broadcast_create_index(query).await,
+            "$drop index" => self.broadcast_drop_index(query).await,
+            "$count" => match self.cmd_count(query).await {
+                Ok(docs) => return MsgOpReply::ok(header.opcode, header.request_id, docs),
+                Err(e) => Err(e),
+            },
             _ => Err(SdbError::InvalidArg),
         };
         match result {
-            Ok(docs) => MsgOpReply::ok(header.opcode, header.request_id, docs),
+            Ok(()) => MsgOpReply::ok(header.opcode, header.request_id, vec![]),
             Err(e) => MsgOpReply::error(header.opcode, header.request_id, &e),
         }
     }
 
-    /// Broadcast a DDL operation to all groups.
-    fn cmd_broadcast_ddl<F>(&self, op: F) -> Result<Vec<Document>>
-    where
-        F: Fn(&mut CatalogManager) -> Result<()>,
-    {
-        for cat_lock in self.groups.values() {
-            let mut cat = cat_lock.write().map_err(|_| SdbError::Sys)?;
-            op(&mut cat)?;
+    // ── DDL broadcast methods ───────────────────────────────────────
+
+    async fn broadcast_create_cs(&self, name: &str) -> Result<()> {
+        for client in self.clients.values() {
+            client.create_collection_space(name).await?;
         }
-        Ok(vec![])
+        Ok(())
     }
 
-    fn cmd_broadcast_index_ddl(
-        &self,
-        query: &MsgOpQuery,
-        create: bool,
-    ) -> Result<Vec<Document>> {
+    async fn broadcast_drop_cs(&self, name: &str) -> Result<()> {
+        for client in self.clients.values() {
+            client.drop_collection_space(name).await?;
+        }
+        Ok(())
+    }
+
+    async fn broadcast_create_cl(&self, full_name: &str) -> Result<()> {
+        for client in self.clients.values() {
+            client.create_collection(full_name).await?;
+        }
+        Ok(())
+    }
+
+    async fn broadcast_drop_cl(&self, full_name: &str) -> Result<()> {
+        for client in self.clients.values() {
+            client.drop_collection(full_name).await?;
+        }
+        Ok(())
+    }
+
+    async fn broadcast_create_index(&self, query: &MsgOpQuery) -> Result<()> {
         let cond = query.condition.as_ref().ok_or(SdbError::InvalidArg)?;
         let full_name = match cond.get("Collection") {
             Some(Value::String(s)) => s.clone(),
             _ => return Err(SdbError::InvalidArg),
         };
-        let (cs, cl) = full_name.split_once('.').ok_or(SdbError::InvalidArg)?;
+        let index_doc = match cond.get("Index") {
+            Some(Value::Document(d)) => d,
+            _ => return Err(SdbError::InvalidArg),
+        };
+        let idx_name = match index_doc.get("name") {
+            Some(Value::String(s)) => s.clone(),
+            _ => return Err(SdbError::InvalidArg),
+        };
+        let key_pattern = match index_doc.get("key") {
+            Some(Value::Document(d)) => d.clone(),
+            _ => return Err(SdbError::InvalidArg),
+        };
+        let unique = matches!(index_doc.get("unique"), Some(Value::Boolean(true)));
 
-        if create {
-            let index_doc = match cond.get("Index") {
-                Some(Value::Document(d)) => d,
-                _ => return Err(SdbError::InvalidArg),
-            };
-            let idx_name = match index_doc.get("name") {
-                Some(Value::String(s)) => s.clone(),
-                _ => return Err(SdbError::InvalidArg),
-            };
-            let key_pattern = match index_doc.get("key") {
-                Some(Value::Document(d)) => d.clone(),
-                _ => return Err(SdbError::InvalidArg),
-            };
-            let unique = matches!(index_doc.get("unique"), Some(Value::Boolean(true)));
-
-            for cat_lock in self.groups.values() {
-                let mut cat = cat_lock.write().map_err(|_| SdbError::Sys)?;
-                cat.create_index(cs, cl, &idx_name, key_pattern.clone(), unique)?;
-            }
-        } else {
-            let idx_name = match cond.get("Index") {
-                Some(Value::String(s)) => s.clone(),
-                _ => return Err(SdbError::InvalidArg),
-            };
-            for cat_lock in self.groups.values() {
-                let mut cat = cat_lock.write().map_err(|_| SdbError::Sys)?;
-                cat.drop_index(cs, cl, &idx_name)?;
-            }
+        for client in self.clients.values() {
+            client
+                .create_index(&full_name, &idx_name, key_pattern.clone(), unique)
+                .await?;
         }
-        Ok(vec![])
+        Ok(())
     }
+
+    async fn broadcast_drop_index(&self, query: &MsgOpQuery) -> Result<()> {
+        let cond = query.condition.as_ref().ok_or(SdbError::InvalidArg)?;
+        let full_name = match cond.get("Collection") {
+            Some(Value::String(s)) => s.clone(),
+            _ => return Err(SdbError::InvalidArg),
+        };
+        let idx_name = match cond.get("Index") {
+            Some(Value::String(s)) => s.clone(),
+            _ => return Err(SdbError::InvalidArg),
+        };
+        for client in self.clients.values() {
+            client.drop_index(&full_name, &idx_name).await?;
+        }
+        Ok(())
+    }
+
+    // ── Data query (scatter-gather) ─────────────────────────────────
 
     async fn handle_data_query(&self, header: &MsgHeader, query: &MsgOpQuery) -> MsgOpReply {
         let result = self.execute_scatter_query(query).await;
         match result {
             Ok(docs) => {
+                self.metrics.inc_query();
                 let mut cursors = self.cursors.lock().unwrap();
                 let (batch, context_id) = cursors.create_cursor(docs);
                 let mut reply =
@@ -190,25 +219,26 @@ impl CoordNodeHandler {
     }
 
     /// Execute a query across relevant groups and merge results.
-    /// Broadcasts to all groups when no sharding is configured for the collection.
-    async fn execute_scatter_query(&self, query: &MsgOpQuery) -> Result<Vec<Document>> {
+    pub async fn execute_scatter_query(&self, query: &MsgOpQuery) -> Result<Vec<Document>> {
         let target_groups = {
             let router = self.router.read().map_err(|_| SdbError::Sys)?;
             let routed = router.route_query(&query.name, query.condition.as_ref())?;
             // If only default group returned and we have multiple groups,
             // broadcast to all (unsharded collection).
-            if routed.len() == 1 && self.groups.len() > 1 && !self.groups.contains_key(&routed[0]) {
-                self.groups.keys().copied().collect()
-            } else if routed.len() == 1 && self.groups.len() > 1 {
+            if routed.len() == 1 && self.clients.len() > 1 && !self.clients.contains_key(&routed[0])
+            {
+                self.clients.keys().copied().collect()
+            } else if routed.len() == 1 && self.clients.len() > 1 {
                 // Check if there's actually a shard registered
-                let has_shard = router.route_query(&query.name, None)
+                let has_shard = router
+                    .route_query(&query.name, None)
                     .map(|v| v.len() > 1)
                     .unwrap_or(false);
                 if has_shard {
                     routed
                 } else {
-                    // No sharding — broadcast to all groups
-                    self.groups.keys().copied().collect()
+                    // No sharding -- broadcast to all groups
+                    self.clients.keys().copied().collect()
                 }
             } else {
                 routed
@@ -218,125 +248,130 @@ impl CoordNodeHandler {
         let mut all_docs = Vec::new();
 
         for &gid in &target_groups {
-            let cat_lock = self.groups.get(&gid).ok_or(SdbError::NodeNotFound)?;
-            let docs = execute_query_on_group(cat_lock, query).await?;
+            let client = self.clients.get(&gid).ok_or(SdbError::NodeNotFound)?;
+            let docs = client
+                .query(
+                    &query.name,
+                    query.condition.clone(),
+                    query.selector.clone(),
+                    query.order_by.clone(),
+                    query.num_to_skip,
+                    query.num_to_return,
+                )
+                .await?;
             all_docs.extend(docs);
         }
 
         Ok(all_docs)
     }
 
-    fn handle_insert(&self, header: &MsgHeader, payload: &[u8]) -> MsgOpReply {
+    // ── Insert routing ──────────────────────────────────────────────
+
+    async fn handle_insert(&self, header: &MsgHeader, payload: &[u8]) -> MsgOpReply {
         let msg = match MsgOpInsert::decode(header, payload) {
             Ok(m) => m,
             Err(e) => return MsgOpReply::error(header.opcode, header.request_id, &e),
         };
 
-        let result = (|| -> Result<()> {
-            let (cs, cl) = msg.name.split_once('.').ok_or(SdbError::InvalidArg)?;
-            let router = self.router.read().map_err(|_| SdbError::Sys)?;
-
+        // Compute grouping synchronously (no .await while holding lock)
+        let grouped = {
+            let router = match self.router.read() {
+                Ok(r) => r,
+                Err(_) => return MsgOpReply::error(header.opcode, header.request_id, &SdbError::Sys),
+            };
+            let mut grouped: HashMap<GroupId, Vec<Document>> = HashMap::new();
             for doc in &msg.docs {
-                let gid = router.route_insert(&msg.name, doc)?;
-                let cat_lock = self.groups.get(&gid).ok_or(SdbError::NodeNotFound)?;
-                let catalog = cat_lock.read().map_err(|_| SdbError::Sys)?;
-                catalog.insert_document(cs, cl, doc)?;
+                match router.route_insert(&msg.name, doc) {
+                    Ok(gid) => grouped.entry(gid).or_default().push(doc.clone()),
+                    Err(e) => return MsgOpReply::error(header.opcode, header.request_id, &e),
+                }
             }
-            Ok(())
-        })();
+            grouped
+        }; // router lock dropped here
+
+        let result = async {
+            for (gid, docs) in grouped {
+                let client = self.clients.get(&gid).ok_or(SdbError::NodeNotFound)?;
+                client.insert(&msg.name, docs).await?;
+            }
+            Ok::<(), SdbError>(())
+        }
+        .await;
 
         match result {
-            Ok(()) => MsgOpReply::ok(header.opcode, header.request_id, vec![]),
+            Ok(()) => {
+                self.metrics.inc_insert();
+                MsgOpReply::ok(header.opcode, header.request_id, vec![])
+            }
             Err(e) => MsgOpReply::error(header.opcode, header.request_id, &e),
         }
     }
 
-    fn handle_update(&self, header: &MsgHeader, payload: &[u8]) -> MsgOpReply {
+    // ── Update broadcast ────────────────────────────────────────────
+
+    async fn handle_update(&self, header: &MsgHeader, payload: &[u8]) -> MsgOpReply {
         let msg = match MsgOpUpdate::decode(header, payload) {
             Ok(m) => m,
             Err(e) => return MsgOpReply::error(header.opcode, header.request_id, &e),
         };
 
-        let result = (|| -> Result<i32> {
-            let (cs, cl) = msg.name.split_once('.').ok_or(SdbError::InvalidArg)?;
-            let router = self.router.read().map_err(|_| SdbError::Sys)?;
-            let target_groups =
-                router.route_update(&msg.name, Some(&msg.condition))?;
-            drop(router);
-
-            let matcher = Matcher::new(msg.condition.clone())?;
-            let modifier = Modifier::new(msg.modifier.clone())?;
-            let mut total = 0i32;
+        let result = async {
+            let target_groups = {
+                let router = self.router.read().map_err(|_| SdbError::Sys)?;
+                router.route_update(&msg.name, Some(&msg.condition))?
+            };
 
             for &gid in &target_groups {
-                let cat_lock = self.groups.get(&gid).ok_or(SdbError::NodeNotFound)?;
-                let catalog = cat_lock.read().map_err(|_| SdbError::Sys)?;
-                let (storage, _) = catalog.collection_handle(cs, cl)?;
-                let rows = storage.scan();
-
-                let matching: Vec<RecordId> = rows
-                    .iter()
-                    .filter(|(_, doc)| matcher.matches(doc).unwrap_or(false))
-                    .map(|(rid, _)| *rid)
-                    .collect();
-
-                for rid in matching {
-                    let old = storage.find(rid)?;
-                    let new = modifier.modify(&old)?;
-                    catalog.update_document(cs, cl, rid, &new)?;
-                    total += 1;
-                }
+                let client = self.clients.get(&gid).ok_or(SdbError::NodeNotFound)?;
+                client
+                    .update(&msg.name, msg.condition.clone(), msg.modifier.clone())
+                    .await?;
             }
-            Ok(total)
-        })();
+            Ok::<(), SdbError>(())
+        }
+        .await;
 
         match result {
-            Ok(_) => MsgOpReply::ok(header.opcode, header.request_id, vec![]),
+            Ok(()) => {
+                self.metrics.inc_update();
+                MsgOpReply::ok(header.opcode, header.request_id, vec![])
+            }
             Err(e) => MsgOpReply::error(header.opcode, header.request_id, &e),
         }
     }
 
-    fn handle_delete(&self, header: &MsgHeader, payload: &[u8]) -> MsgOpReply {
+    // ── Delete broadcast ────────────────────────────────────────────
+
+    async fn handle_delete(&self, header: &MsgHeader, payload: &[u8]) -> MsgOpReply {
         let msg = match MsgOpDelete::decode(header, payload) {
             Ok(m) => m,
             Err(e) => return MsgOpReply::error(header.opcode, header.request_id, &e),
         };
 
-        let result = (|| -> Result<i32> {
-            let (cs, cl) = msg.name.split_once('.').ok_or(SdbError::InvalidArg)?;
-            let router = self.router.read().map_err(|_| SdbError::Sys)?;
-            let target_groups =
-                router.route_delete(&msg.name, Some(&msg.condition))?;
-            drop(router);
-
-            let matcher = Matcher::new(msg.condition.clone())?;
-            let mut total = 0i32;
+        let result = async {
+            let target_groups = {
+                let router = self.router.read().map_err(|_| SdbError::Sys)?;
+                router.route_delete(&msg.name, Some(&msg.condition))?
+            };
 
             for &gid in &target_groups {
-                let cat_lock = self.groups.get(&gid).ok_or(SdbError::NodeNotFound)?;
-                let catalog = cat_lock.read().map_err(|_| SdbError::Sys)?;
-                let (storage, _) = catalog.collection_handle(cs, cl)?;
-                let rows = storage.scan();
-
-                let matching: Vec<RecordId> = rows
-                    .iter()
-                    .filter(|(_, doc)| matcher.matches(doc).unwrap_or(false))
-                    .map(|(rid, _)| *rid)
-                    .collect();
-
-                for rid in matching {
-                    catalog.delete_document(cs, cl, rid)?;
-                    total += 1;
-                }
+                let client = self.clients.get(&gid).ok_or(SdbError::NodeNotFound)?;
+                client.delete(&msg.name, msg.condition.clone()).await?;
             }
-            Ok(total)
-        })();
+            Ok::<(), SdbError>(())
+        }
+        .await;
 
         match result {
-            Ok(_) => MsgOpReply::ok(header.opcode, header.request_id, vec![]),
+            Ok(()) => {
+                self.metrics.inc_delete();
+                MsgOpReply::ok(header.opcode, header.request_id, vec![])
+            }
             Err(e) => MsgOpReply::error(header.opcode, header.request_id, &e),
         }
     }
+
+    // ── GetMore / KillContext ────────────────────────────────────────
 
     fn handle_get_more(&self, header: &MsgHeader, payload: &[u8]) -> MsgOpReply {
         let msg = match MsgOpGetMore::decode(header, payload) {
@@ -369,13 +404,73 @@ impl CoordNodeHandler {
         MsgOpReply::ok(header.opcode, header.request_id, vec![])
     }
 
-    fn cmd_count(&self, query: &MsgOpQuery) -> Result<Vec<Document>> {
+    // ── Transaction handlers ─────────────────────────────────────────
+
+    async fn handle_trans_begin(&self, header: &MsgHeader, addr: &SocketAddr) -> MsgOpReply {
+        let mut group_txns = HashMap::new();
+        for (&gid, client) in &self.clients {
+            match client.transaction_begin().await {
+                Ok(txn_id) => { group_txns.insert(gid, txn_id); }
+                Err(e) => {
+                    // Rollback already started txns
+                    for (&rgid, _) in &group_txns {
+                        let _ = self.clients[&rgid].transaction_rollback().await;
+                    }
+                    return MsgOpReply::error(header.opcode, header.request_id, &e);
+                }
+            }
+        }
+        self.coord_txns.lock().unwrap_or_else(|e| e.into_inner())
+            .insert(*addr, CoordTxnState { group_txns });
+
+        let mut doc = Document::new();
+        doc.insert("txn_id", Value::Int64(1)); // coord-level placeholder
+        MsgOpReply::ok(header.opcode, header.request_id, vec![doc])
+    }
+
+    async fn handle_trans_commit(&self, header: &MsgHeader, addr: &SocketAddr) -> MsgOpReply {
+        let state = self.coord_txns.lock().unwrap_or_else(|e| e.into_inner()).remove(addr);
+        match state {
+            Some(state) => {
+                let mut committed = Vec::new();
+                for (&gid, _) in &state.group_txns {
+                    match self.clients[&gid].transaction_commit().await {
+                        Ok(()) => committed.push(gid),
+                        Err(e) => {
+                            // Rollback uncommitted groups
+                            for (&rgid, _) in &state.group_txns {
+                                if !committed.contains(&rgid) {
+                                    let _ = self.clients[&rgid].transaction_rollback().await;
+                                }
+                            }
+                            return MsgOpReply::error(header.opcode, header.request_id, &e);
+                        }
+                    }
+                }
+                MsgOpReply::ok(header.opcode, header.request_id, vec![])
+            }
+            None => MsgOpReply::error(header.opcode, header.request_id, &SdbError::TransactionError),
+        }
+    }
+
+    async fn handle_trans_rollback(&self, header: &MsgHeader, addr: &SocketAddr) -> MsgOpReply {
+        let state = self.coord_txns.lock().unwrap_or_else(|e| e.into_inner()).remove(addr);
+        if let Some(_state) = state {
+            for (_, client) in &self.clients {
+                let _ = client.transaction_rollback().await;
+            }
+        }
+        MsgOpReply::ok(header.opcode, header.request_id, vec![])
+    }
+
+    // ── Count ───────────────────────────────────────────────────────
+
+    pub async fn cmd_count(&self, query: &MsgOpQuery) -> Result<Vec<Document>> {
         let cond = query.condition.as_ref().ok_or(SdbError::InvalidArg)?;
         let collection = match cond.get("Collection") {
             Some(Value::String(s)) => s.clone(),
             _ => return Err(SdbError::InvalidArg),
         };
-        let (cs, cl) = collection.split_once('.').ok_or(SdbError::InvalidArg)?;
 
         let filter_cond = match cond.get("Condition") {
             Some(Value::Document(d)) => Some(d.clone()),
@@ -383,20 +478,8 @@ impl CoordNodeHandler {
         };
 
         let mut total: u64 = 0;
-        for cat_lock in self.groups.values() {
-            let catalog = cat_lock.read().map_err(|_| SdbError::Sys)?;
-            if let Ok((storage, _)) = catalog.collection_handle(cs, cl) {
-                if let Some(ref fc) = filter_cond {
-                    let matcher = Matcher::new(fc.clone())?;
-                    let rows = storage.scan();
-                    total += rows
-                        .iter()
-                        .filter(|(_, doc)| matcher.matches(doc).unwrap_or(false))
-                        .count() as u64;
-                } else {
-                    total += storage.total_records();
-                }
-            }
+        for client in self.clients.values() {
+            total += client.count(&collection, filter_cond.clone()).await?;
         }
 
         let mut result = Document::new();
@@ -414,15 +497,19 @@ impl MessageHandler for CoordNodeHandler {
         payload: &[u8],
     ) -> Result<()> {
         let opcode = OpCode::from_i32(header.opcode);
-        tracing::debug!("Coord received opcode {:?} from {}", opcode, conn.addr);
+        let addr = conn.addr;
+        tracing::debug!("Coord received opcode {:?} from {}", opcode, addr);
 
         let reply = match opcode {
             Some(OpCode::QueryReq) => self.handle_query(&header, payload).await,
-            Some(OpCode::InsertReq) => self.handle_insert(&header, payload),
-            Some(OpCode::UpdateReq) => self.handle_update(&header, payload),
-            Some(OpCode::DeleteReq) => self.handle_delete(&header, payload),
+            Some(OpCode::InsertReq) => self.handle_insert(&header, payload).await,
+            Some(OpCode::UpdateReq) => self.handle_update(&header, payload).await,
+            Some(OpCode::DeleteReq) => self.handle_delete(&header, payload).await,
             Some(OpCode::GetMoreReq) => self.handle_get_more(&header, payload),
             Some(OpCode::KillContextReq) => self.handle_kill_context(&header, payload),
+            Some(OpCode::TransBeginReq) => self.handle_trans_begin(&header, &addr).await,
+            Some(OpCode::TransCommitReq) => self.handle_trans_commit(&header, &addr).await,
+            Some(OpCode::TransRollbackReq) => self.handle_trans_rollback(&header, &addr).await,
             Some(OpCode::Disconnect) => return Err(SdbError::NetworkClose),
             _ => MsgOpReply::error(header.opcode, header.request_id, &SdbError::InvalidArg),
         };
@@ -432,55 +519,18 @@ impl MessageHandler for CoordNodeHandler {
 
     async fn on_connect(&self, conn: &Connection) -> Result<()> {
         tracing::info!("Coord client connected: {}", conn.addr);
+        self.metrics.inc_sessions();
         Ok(())
     }
 
     async fn on_disconnect(&self, conn: &Connection) -> Result<()> {
         tracing::info!("Coord client disconnected: {}", conn.addr);
+        self.metrics.dec_sessions();
         Ok(())
     }
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
-
-/// Execute a query on a single group's catalog.
-async fn execute_query_on_group(
-    cat_lock: &Arc<RwLock<CatalogManager>>,
-    query: &MsgOpQuery,
-) -> Result<Vec<Document>> {
-    let (cs, cl) = query.name.split_once('.').ok_or(SdbError::InvalidArg)?;
-
-    let (plan, executor) = {
-        let catalog = cat_lock.read().map_err(|_| SdbError::Sys)?;
-        let stats = catalog.collection_stats(cs, cl)?;
-        let (storage, indexes) = catalog.collection_handle(cs, cl)?;
-
-        let optimizer = Optimizer::new();
-        let plan = optimizer.optimize(
-            &query.name,
-            query.condition.as_ref(),
-            query.selector.as_ref(),
-            query.order_by.as_ref(),
-            query.num_to_skip,
-            query.num_to_return,
-            &stats,
-        )?;
-
-        let mut executor = DefaultExecutor::new();
-        executor.register(
-            query.name.clone(),
-            CollectionHandle { storage, indexes },
-        );
-        (plan, executor)
-    };
-
-    let mut cursor = executor.execute(&plan).await?;
-    let mut docs = Vec::new();
-    while let Ok(Some(doc)) = cursor.next() {
-        docs.push(doc);
-    }
-    Ok(docs)
-}
 
 fn get_string_field(doc: Option<&Document>, key: &str) -> Result<String> {
     let doc = doc.ok_or(SdbError::InvalidArg)?;
@@ -493,6 +543,9 @@ fn get_string_field(doc: Option<&Document>, key: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::handler::DataNodeHandler;
+    use sdb_cat::CatalogManager;
+    use tokio::net::TcpListener;
 
     fn doc(pairs: &[(&str, Value)]) -> Document {
         let mut d = Document::new();
@@ -502,122 +555,122 @@ mod tests {
         d
     }
 
-    #[test]
-    fn create_coord_with_groups() {
-        let coord = CoordNodeHandler::new(&[1, 2, 3]);
+    /// Start a DataNode server on ephemeral port, return port.
+    async fn start_data_node() -> u16 {
+        let catalog = Arc::new(std::sync::RwLock::new(CatalogManager::new()));
+        let handler: Arc<dyn MessageHandler> = Arc::new(DataNodeHandler::new(catalog));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let (stream, addr) = listener.accept().await.unwrap();
+                let handler = handler.clone();
+                tokio::spawn(async move {
+                    let mut conn = sdb_net::Connection::new(stream, addr);
+                    let _ = handler.on_connect(&conn).await;
+                    while let Ok((header, payload)) = conn.recv_msg().await {
+                        if handler.on_message(&mut conn, header, &payload).await.is_err() {
+                            break;
+                        }
+                    }
+                    let _ = handler.on_disconnect(&conn).await;
+                });
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn create_coord_with_groups() {
+        let p1 = start_data_node().await;
+        let p2 = start_data_node().await;
+        let p3 = start_data_node().await;
+        let coord = CoordNodeHandler::new(vec![
+            (1, format!("127.0.0.1:{}", p1)),
+            (2, format!("127.0.0.1:{}", p2)),
+            (3, format!("127.0.0.1:{}", p3)),
+        ]);
         assert_eq!(coord.all_group_ids().len(), 3);
     }
 
-    #[test]
-    fn broadcast_ddl_to_all_groups() {
-        let coord = CoordNodeHandler::new(&[1, 2]);
+    #[tokio::test]
+    async fn broadcast_ddl_to_all_groups() {
+        let p1 = start_data_node().await;
+        let p2 = start_data_node().await;
+        let coord = CoordNodeHandler::new(vec![
+            (1, format!("127.0.0.1:{}", p1)),
+            (2, format!("127.0.0.1:{}", p2)),
+        ]);
 
-        // Create CS on all groups
-        coord
-            .cmd_broadcast_ddl(|cat| {
-                cat.create_collection_space("mycs")?;
-                Ok(())
-            })
-            .unwrap();
-
-        // Verify both groups have the CS
-        for gid in &[1, 2] {
-            let cat = coord.group_catalog(*gid).unwrap();
-            let c = cat.read().unwrap();
-            assert!(c.list_collection_spaces().contains(&"mycs".to_string()));
+        // Broadcast create CS
+        for client in coord.clients.values() {
+            client.create_collection_space("mycs").await.unwrap();
         }
-    }
 
-    #[test]
-    fn insert_routes_to_group() {
-        let coord = CoordNodeHandler::new(&[1, 2, 3]);
-
-        // Create CS/CL on all groups
-        coord
-            .cmd_broadcast_ddl(|cat| {
-                cat.create_collection_space("cs")?;
-                cat.create_collection("cs", "cl")?;
-                Ok(())
-            })
-            .unwrap();
-
-        // Set up hash sharding
-        coord.set_shard("cs.cl", "x", 3).unwrap();
-
-        // Insert a doc — goes to one group
-        let header = MsgHeader::new_request(OpCode::InsertReq as i32, 1);
-        let msg = MsgOpInsert::new(1, "cs.cl", vec![doc(&[("x", Value::Int32(42))])], 0);
-        let bytes = msg.encode();
-        let payload = &bytes[MsgHeader::SIZE..];
-        let reply = coord.handle_insert(&header, payload);
-        assert_eq!(reply.flags, 0);
-
-        // Count total docs across all groups
-        let mut total = 0u64;
-        for gid in &[1, 2, 3] {
-            let cat = coord.group_catalog(*gid).unwrap();
-            let c = cat.read().unwrap();
-            if let Ok((s, _)) = c.collection_handle("cs", "cl") {
-                total += s.total_records();
-            }
+        // Verify by creating a collection in the CS on each
+        for client in coord.clients.values() {
+            client.create_collection("mycs.cl").await.unwrap();
         }
-        assert_eq!(total, 1);
     }
 
     #[tokio::test]
     async fn scatter_query_merges_results() {
-        let coord = CoordNodeHandler::new(&[1, 2]);
+        let p1 = start_data_node().await;
+        let p2 = start_data_node().await;
+        let coord = CoordNodeHandler::new(vec![
+            (1, format!("127.0.0.1:{}", p1)),
+            (2, format!("127.0.0.1:{}", p2)),
+        ]);
 
-        coord
-            .cmd_broadcast_ddl(|cat| {
-                cat.create_collection_space("cs")?;
-                cat.create_collection("cs", "cl")?;
-                Ok(())
-            })
+        // Create CS/CL on all groups
+        for client in coord.clients.values() {
+            client.create_collection_space("cs").await.unwrap();
+            client.create_collection("cs.cl").await.unwrap();
+        }
+
+        // Insert one doc directly into each data node
+        coord.clients[&1]
+            .insert("cs.cl", vec![doc(&[("x", Value::Int32(1))])])
+            .await
+            .unwrap();
+        coord.clients[&2]
+            .insert("cs.cl", vec![doc(&[("x", Value::Int32(2))])])
+            .await
             .unwrap();
 
-        // Insert one doc directly into each group
-        {
-            let cat1 = coord.group_catalog(1).unwrap().read().unwrap();
-            cat1.insert_document("cs", "cl", &doc(&[("x", Value::Int32(1))]))
-                .unwrap();
-        }
-        {
-            let cat2 = coord.group_catalog(2).unwrap().read().unwrap();
-            cat2.insert_document("cs", "cl", &doc(&[("x", Value::Int32(2))]))
-                .unwrap();
-        }
-
-        // Query all — should merge results from both groups
+        // Scatter query via coord
         let query = MsgOpQuery::new(1, "cs.cl", None, None, None, None, 0, -1, 0);
         let docs = coord.execute_scatter_query(&query).await.unwrap();
         assert_eq!(docs.len(), 2);
     }
 
-    #[test]
-    fn count_across_groups() {
-        let coord = CoordNodeHandler::new(&[1, 2]);
+    #[tokio::test]
+    async fn count_across_groups() {
+        let p1 = start_data_node().await;
+        let p2 = start_data_node().await;
+        let coord = CoordNodeHandler::new(vec![
+            (1, format!("127.0.0.1:{}", p1)),
+            (2, format!("127.0.0.1:{}", p2)),
+        ]);
 
-        coord
-            .cmd_broadcast_ddl(|cat| {
-                cat.create_collection_space("cs")?;
-                cat.create_collection("cs", "cl")?;
-                Ok(())
-            })
-            .unwrap();
-
-        // Insert docs directly
-        for gid in &[1, 2] {
-            let cat = coord.group_catalog(*gid).unwrap().read().unwrap();
-            cat.insert_document("cs", "cl", &doc(&[("x", Value::Int32(*gid as i32))]))
-                .unwrap();
+        for client in coord.clients.values() {
+            client.create_collection_space("cs").await.unwrap();
+            client.create_collection("cs.cl").await.unwrap();
         }
+
+        coord.clients[&1]
+            .insert("cs.cl", vec![doc(&[("x", Value::Int32(1))])])
+            .await
+            .unwrap();
+        coord.clients[&2]
+            .insert("cs.cl", vec![doc(&[("x", Value::Int32(2))])])
+            .await
+            .unwrap();
 
         let mut cond = Document::new();
         cond.insert("Collection", Value::String("cs.cl".into()));
         let query = MsgOpQuery::new(1, "$count", Some(cond), None, None, None, 0, -1, 0);
-        let result = coord.cmd_count(&query).unwrap();
-        assert_eq!(result.len(), 1);
+        let result = coord.cmd_count(&query).await.unwrap();
         assert_eq!(result[0].get("count"), Some(&Value::Int64(2)));
     }
 }

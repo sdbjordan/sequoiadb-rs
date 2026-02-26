@@ -1,11 +1,13 @@
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use clap::Parser;
 use sdb_common::config::{NodeConfig, NodeRole};
+use sdb_dps::WriteAheadLog;
 use tracing_subscriber::EnvFilter;
 
 mod coord_handler;
 mod cursor_manager;
+mod data_node_client;
 mod data_store;
 mod handler;
 
@@ -38,6 +40,10 @@ struct Cli {
     /// Catalog address (host:port) for data and coord nodes
     #[arg(long)]
     catalog_addr: Option<String>,
+
+    /// Data node addresses (host:port) for coordinator mode (repeatable)
+    #[arg(long)]
+    data_addr: Vec<String>,
 }
 
 fn parse_role(s: &str) -> NodeRole {
@@ -56,13 +62,32 @@ fn main() {
 
     let cli = Cli::parse();
 
-    let config = NodeConfig {
-        role: parse_role(&cli.role),
-        port: cli.port,
-        db_path: cli.db_path,
-        catalog_addr: cli.catalog_addr,
-        ..NodeConfig::default()
+    // Load base config from file if --config is provided, otherwise use defaults
+    let mut config = if let Some(ref config_path) = cli.config {
+        match NodeConfig::load_from_file(config_path) {
+            Ok(c) => {
+                tracing::info!("Loaded config from {}", config_path);
+                c
+            }
+            Err(e) => {
+                tracing::error!("Failed to load config from {}: {}", config_path, e);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        NodeConfig::default()
     };
+
+    // CLI args override file values
+    config.role = parse_role(&cli.role);
+    config.port = cli.port;
+    config.db_path = cli.db_path;
+    if cli.catalog_addr.is_some() {
+        config.catalog_addr = cli.catalog_addr;
+    }
+    if !cli.data_addr.is_empty() {
+        config.data_addrs = cli.data_addr;
+    }
 
     tracing::info!(
         role = ?config.role,
@@ -83,8 +108,19 @@ fn main() {
 async fn start_coord(config: &NodeConfig) {
     tracing::info!(port = config.port, "Starting coordinator node");
 
-    // Create coord handler with 3 default data groups
-    let coord = Arc::new(CoordNodeHandler::new(&[1, 2, 3]));
+    let data_nodes: Vec<(u32, String)> = if config.data_addrs.is_empty() {
+        tracing::warn!("No data node addresses configured, using default localhost:11810");
+        vec![(1, "127.0.0.1:11810".to_string())]
+    } else {
+        config
+            .data_addrs
+            .iter()
+            .enumerate()
+            .map(|(i, addr)| ((i + 1) as u32, addr.clone()))
+            .collect()
+    };
+
+    let coord = Arc::new(CoordNodeHandler::new(data_nodes));
 
     let mut frame = sdb_net::NetFrame::new(format!("{}:{}", config.host, config.port));
     frame.set_handler(coord);
@@ -105,20 +141,41 @@ async fn start_catalog(config: &NodeConfig) {
 async fn start_data(config: &NodeConfig) {
     tracing::info!(port = config.port, "Starting data node");
 
-    // Try to load persisted data
-    let data_store = DataStore::new(&config.db_path);
-    let catalog = match data_store.load() {
-        Ok(cat) => {
-            tracing::info!("Loaded persisted catalog from {}", config.db_path);
-            Arc::new(RwLock::new(cat))
-        }
+    // Open WAL
+    let wal_path = format!("{}/wal", config.db_path);
+    let mut wal = match WriteAheadLog::open(&wal_path) {
+        Ok(w) => w,
         Err(e) => {
-            tracing::warn!("Could not load catalog ({}), starting fresh", e);
-            Arc::new(RwLock::new(sdb_cat::CatalogManager::new()))
+            tracing::error!("Failed to open WAL at {}: {}", wal_path, e);
+            return;
         }
     };
 
-    let handler = Arc::new(DataNodeHandler::new(catalog.clone()));
+    // Recover catalog from WAL
+    let catalog = match handler::recover_from_wal(&mut wal) {
+        Ok(cat) => {
+            tracing::info!("Recovered catalog from WAL at {}", wal_path);
+            Arc::new(RwLock::new(cat))
+        }
+        Err(e) => {
+            tracing::warn!("WAL recovery failed ({}), trying DataStore fallback", e);
+            // Fallback to DataStore if WAL recovery fails
+            let data_store = DataStore::new(&config.db_path);
+            match data_store.load() {
+                Ok(cat) => {
+                    tracing::info!("Loaded persisted catalog from {}", config.db_path);
+                    Arc::new(RwLock::new(cat))
+                }
+                Err(e2) => {
+                    tracing::warn!("Could not load catalog ({}), starting fresh", e2);
+                    Arc::new(RwLock::new(sdb_cat::CatalogManager::new()))
+                }
+            }
+        }
+    };
+
+    let wal = Arc::new(Mutex::new(wal));
+    let handler = Arc::new(DataNodeHandler::new_with_wal(catalog.clone(), wal));
 
     let mut frame = sdb_net::NetFrame::new(format!("{}:{}", config.host, config.port));
     frame.set_handler(handler);

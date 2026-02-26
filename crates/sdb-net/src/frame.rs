@@ -4,10 +4,15 @@ use sdb_common::Result;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
+#[cfg(feature = "tls")]
+use tokio_rustls::TlsAcceptor;
+
 /// Network event loop — accepts connections and dispatches messages.
 pub struct NetFrame {
     bind_addr: String,
     handler: Option<Arc<dyn MessageHandler>>,
+    #[cfg(feature = "tls")]
+    tls_acceptor: Option<TlsAcceptor>,
 }
 
 impl NetFrame {
@@ -15,11 +20,19 @@ impl NetFrame {
         Self {
             bind_addr: bind_addr.into(),
             handler: None,
+            #[cfg(feature = "tls")]
+            tls_acceptor: None,
         }
     }
 
     pub fn set_handler(&mut self, handler: Arc<dyn MessageHandler>) {
         self.handler = Some(handler);
+    }
+
+    /// Set a TLS acceptor for incoming connections.
+    #[cfg(feature = "tls")]
+    pub fn set_tls_acceptor(&mut self, acceptor: TlsAcceptor) {
+        self.tls_acceptor = Some(acceptor);
     }
 
     /// Start the event loop. Listens for connections and dispatches messages.
@@ -35,6 +48,9 @@ impl NetFrame {
 
         tracing::info!("NetFrame listening on {}", self.bind_addr);
 
+        #[cfg(feature = "tls")]
+        let tls_acceptor = self.tls_acceptor.clone();
+
         loop {
             let (stream, addr) = listener
                 .accept()
@@ -42,8 +58,28 @@ impl NetFrame {
                 .map_err(|_| sdb_common::SdbError::NetworkError)?;
 
             let handler = handler.clone();
+
+            #[cfg(feature = "tls")]
+            let tls_acceptor = tls_acceptor.clone();
+
             tokio::spawn(async move {
+                // If TLS is configured, wrap the stream
+                #[cfg(feature = "tls")]
+                let mut conn = if let Some(ref acceptor) = tls_acceptor {
+                    match acceptor.accept(stream).await {
+                        Ok(tls_stream) => Connection::new_tls_server(tls_stream, addr),
+                        Err(e) => {
+                            tracing::warn!("TLS handshake failed for {}: {}", addr, e);
+                            return;
+                        }
+                    }
+                } else {
+                    Connection::new(stream, addr)
+                };
+
+                #[cfg(not(feature = "tls"))]
                 let mut conn = Connection::new(stream, addr);
+
                 tracing::debug!("Connection accepted from {}", addr);
 
                 if let Err(e) = handler.on_connect(&conn).await {

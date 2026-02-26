@@ -13,6 +13,12 @@ sdb-net = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
+tokio-rustls = { workspace = true, optional = true }
+rustls-pemfile = { workspace = true, optional = true }
+
+[features]
+default = []
+tls = ["sdb-net/tls", "tokio-rustls", "rustls-pemfile"]
 
 [dev-dependencies]
 sdb-cat = { workspace = true }

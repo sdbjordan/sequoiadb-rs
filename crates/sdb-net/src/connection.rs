@@ -2,18 +2,101 @@ use sdb_common::{Result, SdbError};
 use sdb_msg::header::MsgHeader;
 use sdb_msg::reply::MsgOpReply;
 use std::net::SocketAddr;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 
-/// A single TCP connection to a remote client/node.
+/// A stream that is either plain TCP or TLS-wrapped.
+pub enum MaybeTlsStream {
+    Plain(TcpStream),
+    #[cfg(feature = "tls")]
+    Tls(tokio_rustls::client::TlsStream<TcpStream>),
+    #[cfg(feature = "tls")]
+    TlsServer(tokio_rustls::server::TlsStream<TcpStream>),
+}
+
+impl AsyncRead for MaybeTlsStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            MaybeTlsStream::Plain(ref mut s) => Pin::new(s).poll_read(cx, buf),
+            #[cfg(feature = "tls")]
+            MaybeTlsStream::Tls(ref mut s) => Pin::new(s).poll_read(cx, buf),
+            #[cfg(feature = "tls")]
+            MaybeTlsStream::TlsServer(ref mut s) => Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for MaybeTlsStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            MaybeTlsStream::Plain(ref mut s) => Pin::new(s).poll_write(cx, buf),
+            #[cfg(feature = "tls")]
+            MaybeTlsStream::Tls(ref mut s) => Pin::new(s).poll_write(cx, buf),
+            #[cfg(feature = "tls")]
+            MaybeTlsStream::TlsServer(ref mut s) => Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            MaybeTlsStream::Plain(ref mut s) => Pin::new(s).poll_flush(cx),
+            #[cfg(feature = "tls")]
+            MaybeTlsStream::Tls(ref mut s) => Pin::new(s).poll_flush(cx),
+            #[cfg(feature = "tls")]
+            MaybeTlsStream::TlsServer(ref mut s) => Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            MaybeTlsStream::Plain(ref mut s) => Pin::new(s).poll_shutdown(cx),
+            #[cfg(feature = "tls")]
+            MaybeTlsStream::Tls(ref mut s) => Pin::new(s).poll_shutdown(cx),
+            #[cfg(feature = "tls")]
+            MaybeTlsStream::TlsServer(ref mut s) => Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
+/// A single connection to a remote client/node.
 pub struct Connection {
-    stream: TcpStream,
+    stream: MaybeTlsStream,
     pub addr: SocketAddr,
 }
 
 impl Connection {
     pub fn new(stream: TcpStream, addr: SocketAddr) -> Self {
+        Self {
+            stream: MaybeTlsStream::Plain(stream),
+            addr,
+        }
+    }
+
+    /// Create a connection wrapping a MaybeTlsStream.
+    pub fn new_from_stream(stream: MaybeTlsStream, addr: SocketAddr) -> Self {
         Self { stream, addr }
+    }
+
+    /// Create a connection from a TLS server stream.
+    #[cfg(feature = "tls")]
+    pub fn new_tls_server(
+        tls_stream: tokio_rustls::server::TlsStream<TcpStream>,
+        addr: SocketAddr,
+    ) -> Self {
+        Self {
+            stream: MaybeTlsStream::TlsServer(tls_stream),
+            addr,
+        }
     }
 
     /// Send a reply message over the connection.

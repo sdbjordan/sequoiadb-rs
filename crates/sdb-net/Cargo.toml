@@ -12,3 +12,9 @@ tokio = { workspace = true }
 bytes = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
+tokio-rustls = { workspace = true, optional = true }
+rustls-pemfile = { workspace = true, optional = true }
+
+[features]
+default = []
+tls = ["tokio-rustls", "rustls-pemfile"]

@@ -5,9 +5,8 @@ use sdb_common::{Result, SdbError};
 use sdb_msg::header::MsgHeader;
 use sdb_msg::opcode::OpCode;
 use sdb_msg::request::MsgOpGetMore;
-use tokio::sync::Mutex;
 
-use crate::client::{check_reply, InnerConn};
+use crate::client::{check_reply, ConnectionPool, SharedTxn};
 
 /// Client-side cursor for iterating query results.
 ///
@@ -20,7 +19,8 @@ pub struct ClientCursor {
     pos: usize,
     closed: bool,
     context_id: i64,
-    conn: Option<Arc<Mutex<InnerConn>>>,
+    pool: Option<Arc<ConnectionPool>>,
+    txn_conn: Option<SharedTxn>,
 }
 
 impl ClientCursor {
@@ -28,14 +28,16 @@ impl ClientCursor {
     pub(crate) fn new_with_context(
         docs: Vec<Document>,
         context_id: i64,
-        conn: Arc<Mutex<InnerConn>>,
+        pool: Arc<ConnectionPool>,
+        txn_conn: SharedTxn,
     ) -> Self {
         Self {
             buffer: docs,
             pos: 0,
             closed: false,
             context_id,
-            conn: Some(conn),
+            pool: Some(pool),
+            txn_conn: Some(txn_conn),
         }
     }
 
@@ -46,7 +48,8 @@ impl ClientCursor {
             pos: 0,
             closed: false,
             context_id: -1,
-            conn: None,
+            pool: None,
+            txn_conn: None,
         }
     }
 
@@ -80,17 +83,41 @@ impl ClientCursor {
             return Ok(false);
         }
 
-        let conn = self.conn.as_ref().ok_or(SdbError::NetworkError)?;
-        let mut conn = conn.lock().await;
-        let rid = conn.next_id();
+        let context_id = self.context_id;
 
-        let msg = MsgOpGetMore {
-            header: MsgHeader::new_request(OpCode::GetMoreReq as i32, rid),
-            context_id: self.context_id,
-            num_to_return: -1, // use server default batch size
+        // Build the GetMore message bytes using a helper closure
+        let build_get_more = |rid: u64| -> Vec<u8> {
+            let msg = MsgOpGetMore {
+                header: MsgHeader::new_request(OpCode::GetMoreReq as i32, rid),
+                context_id,
+                num_to_return: -1,
+            };
+            msg.encode()
         };
-        let bytes = msg.encode();
-        let reply = conn.send_and_recv(&bytes).await?;
+
+        // If we have a txn_conn, try sending through it first
+        let reply = if let Some(ref txn_conn) = self.txn_conn {
+            let mut txn = txn_conn.lock().await;
+            if let Some(ref mut conn) = *txn {
+                let rid = conn.next_id();
+                let bytes = build_get_more(rid);
+                conn.send_and_recv(&bytes).await?
+            } else {
+                drop(txn);
+                let pool = self.pool.as_ref().ok_or(SdbError::NetworkError)?;
+                let mut guard = pool.acquire().await?;
+                let rid = guard.next_id();
+                let bytes = build_get_more(rid);
+                guard.send_and_recv(&bytes).await?
+            }
+        } else {
+            let pool = self.pool.as_ref().ok_or(SdbError::NetworkError)?;
+            let mut guard = pool.acquire().await?;
+            let rid = guard.next_id();
+            let bytes = build_get_more(rid);
+            guard.send_and_recv(&bytes).await?
+        };
+
         check_reply(&reply)?;
 
         self.context_id = reply.context_id;
@@ -127,17 +154,40 @@ impl ClientCursor {
         self.closed = true;
 
         if self.context_id != -1 {
-            if let Some(ref conn) = self.conn {
-                let mut conn = conn.lock().await;
-                let rid = conn.next_id();
+            let context_id = self.context_id;
+            let build_kill = |rid: u64| -> Vec<u8> {
                 let msg = sdb_msg::request::MsgOpKillContexts {
                     header: MsgHeader::new_request(OpCode::KillContextReq as i32, rid),
-                    context_ids: vec![self.context_id],
+                    context_ids: vec![context_id],
                 };
-                let bytes = msg.encode();
-                // Best-effort: ignore errors
-                let _ = conn.send_and_recv(&bytes).await;
+                msg.encode()
+            };
+
+            // Try txn_conn first, then pool
+            let sent = if let Some(ref txn_conn) = self.txn_conn {
+                let mut txn = txn_conn.lock().await;
+                if let Some(ref mut conn) = *txn {
+                    let rid = conn.next_id();
+                    let bytes = build_kill(rid);
+                    let _ = conn.send_and_recv(&bytes).await;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if !sent {
+                if let Some(ref pool) = self.pool {
+                    if let Ok(mut guard) = pool.acquire().await {
+                        let rid = guard.next_id();
+                        let bytes = build_kill(rid);
+                        let _ = guard.send_and_recv(&bytes).await;
+                    }
+                }
             }
+
             self.context_id = -1;
         }
         Ok(())

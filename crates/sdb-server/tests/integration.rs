@@ -1,7 +1,8 @@
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use sdb_bson::{Document, Value};
 use sdb_cat::CatalogManager;
+use sdb_dps::WriteAheadLog;
 use sdb_msg::header::MsgHeader;
 use sdb_msg::opcode::OpCode;
 use sdb_msg::reply::MsgOpReply;
@@ -12,7 +13,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 // We import the handler from the server crate's lib
 use sdb_server::coord_handler::CoordNodeHandler;
-use sdb_server::handler::DataNodeHandler;
+use sdb_server::handler::{recover_from_wal, DataNodeHandler};
 
 fn doc(pairs: &[(&str, Value)]) -> Document {
     let mut d = Document::new();
@@ -711,9 +712,18 @@ async fn kill_context_closes_cursor() {
 
 // ── Coord handler integration tests ─────────────────────────────────
 
-/// Start a CoordNodeHandler on an ephemeral port.
+/// Start a CoordNodeHandler backed by real DataNode servers on ephemeral ports.
 async fn start_coord_server() -> u16 {
-    let coord = Arc::new(CoordNodeHandler::new(&[1, 2, 3]));
+    // Start 3 data node servers
+    let p1 = start_test_server().await;
+    let p2 = start_test_server().await;
+    let p3 = start_test_server().await;
+
+    let coord = Arc::new(CoordNodeHandler::new(vec![
+        (1, format!("127.0.0.1:{}", p1)),
+        (2, format!("127.0.0.1:{}", p2)),
+        (3, format!("127.0.0.1:{}", p3)),
+    ]));
     let handler: Arc<dyn MessageHandler> = coord;
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -799,4 +809,608 @@ async fn coord_drop_cs_cl() {
     // Drop CS
     let reply = send_recv(&mut stream, &drop_cs_msg(5, "dropcs")).await;
     assert_eq!(reply.flags, 0);
+}
+
+// ── WAL Recovery integration tests ──────────────────────────────────
+
+fn wal_tmp_dir(name: &str) -> String {
+    let p = std::env::temp_dir().join(format!("sdb_wal_integ_{}", name));
+    let _ = std::fs::remove_dir_all(&p);
+    p.to_string_lossy().to_string()
+}
+
+fn wal_cleanup(path: &str) {
+    let _ = std::fs::remove_dir_all(path);
+}
+
+/// Start a test server backed by WAL, returning (port, wal_path).
+async fn start_wal_test_server(wal_path: &str) -> u16 {
+    let wal = WriteAheadLog::open(wal_path).unwrap();
+    let wal = Arc::new(Mutex::new(wal));
+    let catalog = Arc::new(RwLock::new(CatalogManager::new()));
+    let handler: Arc<dyn MessageHandler> =
+        Arc::new(DataNodeHandler::new_with_wal(catalog, wal));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    tokio::spawn(async move {
+        loop {
+            let (stream, addr) = listener.accept().await.unwrap();
+            let handler = handler.clone();
+            tokio::spawn(async move {
+                let mut conn = sdb_net::Connection::new(stream, addr);
+                let _ = handler.on_connect(&conn).await;
+                while let Ok((header, payload)) = conn.recv_msg().await {
+                    if handler.on_message(&mut conn, header, &payload).await.is_err() {
+                        break;
+                    }
+                }
+                let _ = handler.on_disconnect(&conn).await;
+            });
+        }
+    });
+
+    port
+}
+
+#[tokio::test]
+async fn wal_recovery_insert_documents() {
+    let wal_dir = wal_tmp_dir("recovery_insert");
+
+    // Phase 1: Create data with WAL enabled
+    {
+        let port = start_wal_test_server(&wal_dir).await;
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+            .await
+            .unwrap();
+
+        // Create CS + CL
+        let reply = send_recv(&mut stream, &create_cs_msg(1, "wcs")).await;
+        assert_eq!(reply.flags, 0, "create cs should succeed");
+
+        let reply = send_recv(&mut stream, &create_cl_msg(2, "wcs.wcl")).await;
+        assert_eq!(reply.flags, 0, "create cl should succeed");
+
+        // Insert documents
+        let docs = vec![
+            doc(&[("x", Value::Int32(1)), ("name", Value::String("alice".into()))]),
+            doc(&[("x", Value::Int32(2)), ("name", Value::String("bob".into()))]),
+            doc(&[("x", Value::Int32(3)), ("name", Value::String("charlie".into()))]),
+        ];
+        let reply = send_recv(&mut stream, &insert_msg(3, "wcs.wcl", docs)).await;
+        assert_eq!(reply.flags, 0, "insert should succeed");
+
+        // Drop the connection (simulates crash — server handler is dropped)
+        drop(stream);
+    }
+
+    // Phase 2: Recover from WAL
+    {
+        let mut wal = WriteAheadLog::open(&wal_dir).unwrap();
+        let catalog = recover_from_wal(&mut wal).unwrap();
+
+        // Verify: CS exists
+        catalog.get_collection_space("wcs").unwrap();
+
+        // Verify: CL exists
+        catalog.get_collection("wcs", "wcl").unwrap();
+
+        // Verify: all 3 documents recovered
+        let (storage, _) = catalog.collection_handle("wcs", "wcl").unwrap();
+        let rows = storage.scan();
+        assert_eq!(rows.len(), 3, "should recover 3 documents");
+
+        let names: Vec<String> = rows
+            .iter()
+            .filter_map(|(_, d)| match d.get("name") {
+                Some(Value::String(s)) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(names.contains(&"alice".to_string()));
+        assert!(names.contains(&"bob".to_string()));
+        assert!(names.contains(&"charlie".to_string()));
+    }
+
+    wal_cleanup(&wal_dir);
+}
+
+#[tokio::test]
+async fn wal_recovery_with_deletes() {
+    let wal_dir = wal_tmp_dir("recovery_delete");
+
+    // Phase 1: Insert then delete
+    {
+        let port = start_wal_test_server(&wal_dir).await;
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+            .await
+            .unwrap();
+
+        send_recv(&mut stream, &create_cs_msg(1, "dcs")).await;
+        send_recv(&mut stream, &create_cl_msg(2, "dcs.dcl")).await;
+
+        let docs = vec![
+            doc(&[("x", Value::Int32(1))]),
+            doc(&[("x", Value::Int32(2))]),
+            doc(&[("x", Value::Int32(3))]),
+        ];
+        send_recv(&mut stream, &insert_msg(3, "dcs.dcl", docs)).await;
+
+        // Delete x=2
+        let reply = send_recv(
+            &mut stream,
+            &delete_msg(4, "dcs.dcl", doc(&[("x", Value::Int32(2))])),
+        )
+        .await;
+        assert_eq!(reply.flags, 0);
+
+        drop(stream);
+    }
+
+    // Phase 2: Recover
+    {
+        let mut wal = WriteAheadLog::open(&wal_dir).unwrap();
+        let catalog = recover_from_wal(&mut wal).unwrap();
+
+        let (storage, _) = catalog.collection_handle("dcs", "dcl").unwrap();
+        let rows = storage.scan();
+        assert_eq!(rows.len(), 2, "should have 2 docs after recovery (3 - 1 deleted)");
+
+        let vals: Vec<i32> = rows
+            .iter()
+            .filter_map(|(_, d)| match d.get("x") {
+                Some(Value::Int32(v)) => Some(*v),
+                _ => None,
+            })
+            .collect();
+        assert!(vals.contains(&1));
+        assert!(!vals.contains(&2));
+        assert!(vals.contains(&3));
+    }
+
+    wal_cleanup(&wal_dir);
+}
+
+#[tokio::test]
+async fn wal_recovery_with_updates() {
+    let wal_dir = wal_tmp_dir("recovery_update");
+
+    // Phase 1: Insert then update
+    {
+        let port = start_wal_test_server(&wal_dir).await;
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+            .await
+            .unwrap();
+
+        send_recv(&mut stream, &create_cs_msg(1, "ucs")).await;
+        send_recv(&mut stream, &create_cl_msg(2, "ucs.ucl")).await;
+
+        let docs = vec![doc(&[("x", Value::Int32(1)), ("y", Value::Int32(10))])];
+        send_recv(&mut stream, &insert_msg(3, "ucs.ucl", docs)).await;
+
+        // Update: x=1 => set y=99
+        let modifier = doc(&[("$set", Value::Document(doc(&[("y", Value::Int32(99))])))]);
+        let reply = send_recv(
+            &mut stream,
+            &update_msg(4, "ucs.ucl", doc(&[("x", Value::Int32(1))]), modifier),
+        )
+        .await;
+        assert_eq!(reply.flags, 0);
+
+        drop(stream);
+    }
+
+    // Phase 2: Recover
+    {
+        let mut wal = WriteAheadLog::open(&wal_dir).unwrap();
+        let catalog = recover_from_wal(&mut wal).unwrap();
+
+        let (storage, _) = catalog.collection_handle("ucs", "ucl").unwrap();
+        let rows = storage.scan();
+        assert_eq!(rows.len(), 1, "should have 1 doc after recovery");
+
+        let (_, doc) = &rows[0];
+        assert_eq!(doc.get("x"), Some(&Value::Int32(1)));
+        assert_eq!(doc.get("y"), Some(&Value::Int32(99)));
+    }
+
+    wal_cleanup(&wal_dir);
+}
+
+#[tokio::test]
+async fn wal_recovery_ddl_drop_cs() {
+    let wal_dir = wal_tmp_dir("recovery_drop_cs");
+
+    // Phase 1: Create CS, CL, insert, then drop CS
+    {
+        let port = start_wal_test_server(&wal_dir).await;
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+            .await
+            .unwrap();
+
+        send_recv(&mut stream, &create_cs_msg(1, "tempcs")).await;
+        send_recv(&mut stream, &create_cl_msg(2, "tempcs.tempcl")).await;
+        send_recv(
+            &mut stream,
+            &insert_msg(3, "tempcs.tempcl", vec![doc(&[("a", Value::Int32(1))])]),
+        )
+        .await;
+
+        // Drop CS
+        let reply = send_recv(&mut stream, &drop_cs_msg(4, "tempcs")).await;
+        assert_eq!(reply.flags, 0);
+
+        drop(stream);
+    }
+
+    // Phase 2: Recover — CS should NOT exist
+    {
+        let mut wal = WriteAheadLog::open(&wal_dir).unwrap();
+        let catalog = recover_from_wal(&mut wal).unwrap();
+
+        let result = catalog.get_collection_space("tempcs");
+        assert!(result.is_err(), "CS should not exist after drop + recovery");
+    }
+
+    wal_cleanup(&wal_dir);
+}
+
+#[tokio::test]
+async fn wal_recovery_create_index() {
+    let wal_dir = wal_tmp_dir("recovery_index");
+
+    // Phase 1: Create CS, CL, insert docs, create index
+    {
+        let port = start_wal_test_server(&wal_dir).await;
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+            .await
+            .unwrap();
+
+        send_recv(&mut stream, &create_cs_msg(1, "ics")).await;
+        send_recv(&mut stream, &create_cl_msg(2, "ics.icl")).await;
+
+        let docs: Vec<Document> = (0..5)
+            .map(|i| doc(&[("val", Value::Int32(i))]))
+            .collect();
+        send_recv(&mut stream, &insert_msg(3, "ics.icl", docs)).await;
+
+        // Create index
+        let key = doc(&[("val", Value::Int32(1))]);
+        let reply = send_recv(
+            &mut stream,
+            &create_index_msg(4, "ics.icl", "idx_val", key, false),
+        )
+        .await;
+        assert_eq!(reply.flags, 0);
+
+        drop(stream);
+    }
+
+    // Phase 2: Recover — index should exist
+    {
+        let mut wal = WriteAheadLog::open(&wal_dir).unwrap();
+        let catalog = recover_from_wal(&mut wal).unwrap();
+
+        let cl = catalog.get_collection("ics", "icl").unwrap();
+        assert_eq!(cl.indexes.len(), 1);
+        assert_eq!(cl.indexes[0].name, "idx_val");
+
+        // Verify all 5 docs recovered
+        let (storage, _) = catalog.collection_handle("ics", "icl").unwrap();
+        let rows = storage.scan();
+        assert_eq!(rows.len(), 5);
+    }
+
+    wal_cleanup(&wal_dir);
+}
+
+// ── Transaction helpers ──────────────────────────────────────────────
+
+fn trans_begin_msg(request_id: u64) -> Vec<u8> {
+    let header = MsgHeader::new_request(OpCode::TransBeginReq as i32, request_id);
+    let mut buf = Vec::new();
+    header.encode(&mut buf);
+    let len = buf.len() as i32;
+    buf[0..4].copy_from_slice(&len.to_le_bytes());
+    buf
+}
+
+fn trans_commit_msg(request_id: u64) -> Vec<u8> {
+    let header = MsgHeader::new_request(OpCode::TransCommitReq as i32, request_id);
+    let mut buf = Vec::new();
+    header.encode(&mut buf);
+    let len = buf.len() as i32;
+    buf[0..4].copy_from_slice(&len.to_le_bytes());
+    buf
+}
+
+fn trans_rollback_msg(request_id: u64) -> Vec<u8> {
+    let header = MsgHeader::new_request(OpCode::TransRollbackReq as i32, request_id);
+    let mut buf = Vec::new();
+    header.encode(&mut buf);
+    let len = buf.len() as i32;
+    buf[0..4].copy_from_slice(&len.to_le_bytes());
+    buf
+}
+
+// ── Transaction integration tests ───────────────────────────────────
+
+#[tokio::test]
+async fn transaction_commit_applies_changes() {
+    let port = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).await.unwrap();
+
+    send_recv(&mut stream, &create_cs_msg(1, "txcs")).await;
+    send_recv(&mut stream, &create_cl_msg(2, "txcs.cl")).await;
+
+    // Begin transaction
+    let reply = send_recv(&mut stream, &trans_begin_msg(3)).await;
+    assert_eq!(reply.flags, 0, "begin txn should succeed");
+
+    // Insert within txn (buffered)
+    let reply = send_recv(&mut stream, &insert_msg(4, "txcs.cl", vec![
+        doc(&[("x", Value::Int32(1))]),
+        doc(&[("x", Value::Int32(2))]),
+    ])).await;
+    assert_eq!(reply.flags, 0, "buffered insert should succeed");
+
+    // Commit
+    let reply = send_recv(&mut stream, &trans_commit_msg(5)).await;
+    assert_eq!(reply.flags, 0, "commit should succeed");
+
+    // Verify data exists
+    let reply = send_recv(&mut stream, &query_msg(6, "txcs.cl", None)).await;
+    assert_eq!(reply.flags, 0);
+    assert_eq!(reply.docs.len(), 2, "should have 2 docs after commit");
+}
+
+#[tokio::test]
+async fn transaction_rollback_discards_changes() {
+    let port = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).await.unwrap();
+
+    send_recv(&mut stream, &create_cs_msg(1, "txcs2")).await;
+    send_recv(&mut stream, &create_cl_msg(2, "txcs2.cl")).await;
+
+    // Insert some data outside txn
+    send_recv(&mut stream, &insert_msg(3, "txcs2.cl", vec![doc(&[("x", Value::Int32(0))])])).await;
+
+    // Begin transaction
+    let reply = send_recv(&mut stream, &trans_begin_msg(4)).await;
+    assert_eq!(reply.flags, 0);
+
+    // Insert within txn (buffered)
+    send_recv(&mut stream, &insert_msg(5, "txcs2.cl", vec![doc(&[("x", Value::Int32(999))])])).await;
+
+    // Rollback
+    let reply = send_recv(&mut stream, &trans_rollback_msg(6)).await;
+    assert_eq!(reply.flags, 0, "rollback should succeed");
+
+    // Verify only original data exists (txn insert was discarded)
+    let reply = send_recv(&mut stream, &query_msg(7, "txcs2.cl", None)).await;
+    assert_eq!(reply.flags, 0);
+    assert_eq!(reply.docs.len(), 1, "should have only 1 doc (x=0), txn insert discarded");
+}
+
+// ── Auth enforcement integration tests ──────────────────────────────
+
+#[tokio::test]
+async fn auth_enforcement_blocks_unauthenticated() {
+    let port = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .await
+        .unwrap();
+
+    // First, create a user (bootstrap — no auth needed when no users exist)
+    let reply = send_recv(
+        &mut stream,
+        &create_user_msg(1, "admin", "secret", vec!["admin"]),
+    )
+    .await;
+    assert_eq!(reply.flags, 0, "bootstrap user creation should succeed");
+
+    // Now try to create CS without auth — should fail
+    let reply = send_recv(&mut stream, &create_cs_msg(2, "blocked_cs")).await;
+    assert!(reply.flags < 0, "DDL without auth should fail");
+
+    // Try insert without auth — should fail
+    let reply = send_recv(
+        &mut stream,
+        &insert_msg(
+            3,
+            "blocked.cl",
+            vec![doc(&[("x", Value::Int32(1))])],
+        ),
+    )
+    .await;
+    assert!(reply.flags < 0, "insert without auth should fail");
+
+    // Authenticate
+    let reply = send_recv(&mut stream, &authenticate_msg(4, "admin", "secret")).await;
+    assert_eq!(reply.flags, 0, "authenticate should succeed");
+
+    // Now DDL should work
+    let reply = send_recv(&mut stream, &create_cs_msg(5, "authed_cs")).await;
+    assert_eq!(reply.flags, 0, "DDL after auth should succeed");
+
+    let reply = send_recv(&mut stream, &create_cl_msg(6, "authed_cs.cl")).await;
+    assert_eq!(reply.flags, 0, "create cl after auth should succeed");
+
+    // Insert should work
+    let reply = send_recv(
+        &mut stream,
+        &insert_msg(
+            7,
+            "authed_cs.cl",
+            vec![doc(&[("x", Value::Int32(42))])],
+        ),
+    )
+    .await;
+    assert_eq!(reply.flags, 0, "insert after auth should succeed");
+
+    // Query should work
+    let reply = send_recv(&mut stream, &query_msg(8, "authed_cs.cl", None)).await;
+    assert_eq!(reply.flags, 0);
+    assert_eq!(reply.docs.len(), 1);
+}
+
+// ── Snapshot / Monitoring Tests ─────────────────────────────────────────
+
+#[tokio::test]
+async fn snapshot_database_returns_metrics() {
+    let port = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .await
+        .unwrap();
+
+    // Create CS/CL
+    let reply = send_recv(&mut stream, &create_cs_msg(1, "snapcs")).await;
+    assert_eq!(reply.flags, 0);
+    let reply = send_recv(&mut stream, &create_cl_msg(2, "snapcs.cl")).await;
+    assert_eq!(reply.flags, 0);
+
+    // Insert a doc
+    let reply = send_recv(
+        &mut stream,
+        &insert_msg(3, "snapcs.cl", vec![doc(&[("x", Value::Int32(1))])]),
+    )
+    .await;
+    assert_eq!(reply.flags, 0);
+
+    // Query
+    let reply = send_recv(&mut stream, &query_msg(4, "snapcs.cl", None)).await;
+    assert_eq!(reply.flags, 0);
+
+    // Now send $snapshot database
+    let reply = send_recv(&mut stream, &query_msg(5, "$snapshot database", None)).await;
+    assert_eq!(reply.flags, 0, "snapshot database should succeed");
+    assert!(!reply.docs.is_empty(), "snapshot should return at least one doc");
+
+    let snap_doc = &reply.docs[0];
+    // Check that we get metrics fields
+    assert!(snap_doc.get("TotalInsert").is_some(), "should have TotalInsert field");
+    assert!(snap_doc.get("TotalQuery").is_some(), "should have TotalQuery field");
+    assert!(snap_doc.get("ActiveSessions").is_some(), "should have ActiveSessions field");
+
+    // Verify insert counter is non-zero
+    match snap_doc.get("TotalInsert") {
+        Some(Value::Int64(n)) => assert!(*n >= 1, "TotalInsert should be >= 1"),
+        other => panic!("expected Int64 for TotalInsert, got {:?}", other),
+    }
+
+    // Verify query counter is non-zero
+    match snap_doc.get("TotalQuery") {
+        Some(Value::Int64(n)) => assert!(*n >= 1, "TotalQuery should be >= 1"),
+        other => panic!("expected Int64 for TotalQuery, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn snapshot_sessions_returns_session_info() {
+    let port = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .await
+        .unwrap();
+
+    // Send $snapshot sessions
+    let reply = send_recv(&mut stream, &query_msg(1, "$snapshot sessions", None)).await;
+    assert_eq!(reply.flags, 0);
+    assert!(!reply.docs.is_empty());
+
+    let snap_doc = &reply.docs[0];
+    assert_eq!(snap_doc.get("Type"), Some(&Value::String("Sessions".into())));
+    assert!(snap_doc.get("TotalSessions").is_some());
+}
+
+#[tokio::test]
+async fn snapshot_collections_returns_collection_list() {
+    let port = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .await
+        .unwrap();
+
+    // Create some collections
+    let reply = send_recv(&mut stream, &create_cs_msg(1, "snapcs2")).await;
+    assert_eq!(reply.flags, 0);
+    let reply = send_recv(&mut stream, &create_cl_msg(2, "snapcs2.c1")).await;
+    assert_eq!(reply.flags, 0);
+    let reply = send_recv(&mut stream, &create_cl_msg(3, "snapcs2.c2")).await;
+    assert_eq!(reply.flags, 0);
+
+    // Snapshot collections
+    let reply = send_recv(&mut stream, &query_msg(4, "$snapshot collections", None)).await;
+    assert_eq!(reply.flags, 0);
+    assert_eq!(reply.docs.len(), 2, "should list 2 collections");
+
+    let names: Vec<String> = reply.docs.iter().filter_map(|d| {
+        match d.get("Name") {
+            Some(Value::String(s)) => Some(s.clone()),
+            _ => None,
+        }
+    }).collect();
+    assert!(names.contains(&"snapcs2.c1".to_string()));
+    assert!(names.contains(&"snapcs2.c2".to_string()));
+}
+
+#[tokio::test]
+async fn metrics_counters_after_operations() {
+    let port = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .await
+        .unwrap();
+
+    // Setup
+    let _ = send_recv(&mut stream, &create_cs_msg(1, "mcs")).await;
+    let _ = send_recv(&mut stream, &create_cl_msg(2, "mcs.cl")).await;
+
+    // Insert 3 times
+    for i in 3..6u64 {
+        let _ = send_recv(
+            &mut stream,
+            &insert_msg(i, "mcs.cl", vec![doc(&[("v", Value::Int32(i as i32))])]),
+        )
+        .await;
+    }
+
+    // Update
+    let update_bytes = update_msg(
+        6,
+        "mcs.cl",
+        doc(&[("v", Value::Int32(3))]),
+        doc(&[("$set", Value::Document(doc(&[("v", Value::Int32(999))])))]),
+    );
+    let reply = send_recv(&mut stream, &update_bytes).await;
+    assert_eq!(reply.flags, 0);
+
+    // Delete
+    let delete_bytes = MsgOpDelete::new(7, "mcs.cl", doc(&[("v", Value::Int32(4))]), None, 0).encode();
+    let reply = send_recv(&mut stream, &delete_bytes).await;
+    assert_eq!(reply.flags, 0);
+
+    // Query
+    let reply = send_recv(&mut stream, &query_msg(8, "mcs.cl", None)).await;
+    assert_eq!(reply.flags, 0);
+
+    // Check snapshot
+    let reply = send_recv(&mut stream, &query_msg(9, "$snapshot database", None)).await;
+    assert_eq!(reply.flags, 0);
+    let snap = &reply.docs[0];
+
+    match snap.get("TotalInsert") {
+        Some(Value::Int64(n)) => assert!(*n >= 3, "should have >= 3 inserts, got {}", n),
+        other => panic!("expected TotalInsert, got {:?}", other),
+    }
+    match snap.get("TotalUpdate") {
+        Some(Value::Int64(n)) => assert!(*n >= 1, "should have >= 1 update, got {}", n),
+        other => panic!("expected TotalUpdate, got {:?}", other),
+    }
+    match snap.get("TotalDelete") {
+        Some(Value::Int64(n)) => assert!(*n >= 1, "should have >= 1 delete, got {}", n),
+        other => panic!("expected TotalDelete, got {:?}", other),
+    }
+    match snap.get("TotalQuery") {
+        Some(Value::Int64(n)) => assert!(*n >= 1, "should have >= 1 query, got {}", n),
+        other => panic!("expected TotalQuery, got {:?}", other),
+    }
 }

@@ -137,6 +137,7 @@ fn sdb_error_to_i32(err: &SdbError) -> i32 {
         SdbError::Eof => -9,
         SdbError::IndexNotFound => -47,
         SdbError::IndexAlreadyExists => -46,
+        SdbError::AuthFailed => -179,
         _ => -1, // generic system error
     }
 }
