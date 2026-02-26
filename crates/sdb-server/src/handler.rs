@@ -9,7 +9,7 @@ use sdb_bson::{Document, Value};
 use sdb_cat::CatalogManager;
 use sdb_cls::election::{ElectionManager, ElectionState};
 use sdb_cls::ReplicationAgent;
-use sdb_common::{NodeAddress, RecordId, Result, SdbError};
+use sdb_common::{NodeAddress, ReadPreference, RecordId, Result, SdbError};
 use sdb_dps::{LogOp, LogRecord, WriteAheadLog};
 use sdb_mon::{Metrics, Snapshot, SnapshotType};
 use sdb_mth::{Matcher, Modifier};
@@ -53,6 +53,7 @@ pub struct DataNodeHandler {
     election: Option<Arc<StdMutex<ElectionManager>>>,
     repl_agent: Option<Arc<tokio::sync::Mutex<ReplicationAgent>>>,
     wal_path: Option<String>,
+    read_prefs: Arc<StdMutex<HashMap<SocketAddr, ReadPreference>>>,
 }
 
 impl DataNodeHandler {
@@ -69,6 +70,7 @@ impl DataNodeHandler {
             election: None,
             repl_agent: None,
             wal_path: None,
+            read_prefs: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 
@@ -88,6 +90,7 @@ impl DataNodeHandler {
             election: None,
             repl_agent: None,
             wal_path: None,
+            read_prefs: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 
@@ -107,6 +110,7 @@ impl DataNodeHandler {
             election: None,
             repl_agent: None,
             wal_path: None,
+            read_prefs: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 
@@ -144,6 +148,7 @@ impl DataNodeHandler {
             election: Some(Arc::new(StdMutex::new(em))),
             repl_agent: Some(Arc::new(tokio::sync::Mutex::new(agent))),
             wal_path: Some(wal_path),
+            read_prefs: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 
@@ -162,9 +167,53 @@ impl DataNodeHandler {
         }
     }
 
+    /// Check if this connection is allowed to read (considering read preference).
+    /// Primary always allows reads. Secondaries allow reads if read preference permits.
+    pub fn check_read_allowed(&self, addr: &SocketAddr) -> Result<()> {
+        match &self.election {
+            None => Ok(()), // no replication = always allow
+            Some(em) => {
+                let em = em.lock().unwrap_or_else(|e| e.into_inner());
+                if em.is_primary() {
+                    return Ok(()); // primary always allows reads
+                }
+                // We're a secondary — check read preference
+                let pref = self.get_read_preference(addr);
+                if pref.allows_secondary() {
+                    Ok(())
+                } else {
+                    Err(SdbError::NotPrimary)
+                }
+            }
+        }
+    }
+
+    /// Get the read preference for a connection.
+    fn get_read_preference(&self, addr: &SocketAddr) -> ReadPreference {
+        self.read_prefs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(addr)
+            .copied()
+            .unwrap_or(ReadPreference::Primary)
+    }
+
+    /// Set the read preference for a connection.
+    fn set_read_preference(&self, addr: &SocketAddr, pref: ReadPreference) {
+        self.read_prefs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(*addr, pref);
+    }
+
     /// Get the election manager (for tests).
     pub fn election(&self) -> &Option<Arc<StdMutex<ElectionManager>>> {
         &self.election
+    }
+
+    /// Get the replication agent (for tests/dynamic membership).
+    pub fn repl_agent(&self) -> &Option<Arc<tokio::sync::Mutex<ReplicationAgent>>> {
+        &self.repl_agent
     }
 
     /// Get a reference to the metrics for snapshot queries.
@@ -270,6 +319,10 @@ impl DataNodeHandler {
             if let Err(e) = self.check_auth(addr) {
                 return MsgOpReply::error(header.opcode, header.request_id, &e);
             }
+            // Read preference: allow reads on secondaries if preference permits
+            if let Err(e) = self.check_read_allowed(addr) {
+                return MsgOpReply::error(header.opcode, header.request_id, &e);
+            }
             self.handle_data_query(header, &query).await
         }
     }
@@ -317,6 +370,11 @@ impl DataNodeHandler {
                     "$snapshot sessions" => self.cmd_snapshot(SnapshotType::Sessions),
                     "$snapshot collections" => self.cmd_snapshot(SnapshotType::Collections),
                     "$snapshot health" => self.cmd_snapshot(SnapshotType::Health),
+                    "$set read preference" => self.cmd_set_read_preference(query, addr),
+                    "$get read preference" => self.cmd_get_read_preference(addr),
+                    "$add member" => self.cmd_add_member(query),
+                    "$remove member" => self.cmd_remove_member(query),
+                    "$get members" => self.cmd_get_members(),
                     _ => Err(SdbError::InvalidArg),
                 }
             }
@@ -1211,6 +1269,142 @@ impl DataNodeHandler {
             _ => Err(SdbError::InvalidArg),
         }
     }
+    // ── Read Preference commands ─────────────────────────────────────
+
+    fn cmd_set_read_preference(&self, query: &MsgOpQuery, addr: &SocketAddr) -> Result<Vec<Document>> {
+        let cond = query.condition.as_ref().ok_or(SdbError::InvalidArg)?;
+        let pref_str = match cond.get("Preference") {
+            Some(Value::String(s)) => s.clone(),
+            _ => return Err(SdbError::InvalidArg),
+        };
+        let pref = ReadPreference::parse(&pref_str).ok_or(SdbError::InvalidArg)?;
+        self.set_read_preference(addr, pref);
+        let mut doc = Document::new();
+        doc.insert("ReadPreference", Value::String(pref.as_str().to_string()));
+        Ok(vec![doc])
+    }
+
+    fn cmd_get_read_preference(&self, addr: &SocketAddr) -> Result<Vec<Document>> {
+        let pref = self.get_read_preference(addr);
+        let mut doc = Document::new();
+        doc.insert("ReadPreference", Value::String(pref.as_str().to_string()));
+        let is_primary = match &self.election {
+            None => true,
+            Some(em) => em.lock().unwrap_or_else(|e| e.into_inner()).is_primary(),
+        };
+        doc.insert("IsPrimary", Value::Boolean(is_primary));
+        Ok(vec![doc])
+    }
+
+    // ── Dynamic Membership commands ───────────────────────────────────
+
+    fn cmd_add_member(&self, query: &MsgOpQuery) -> Result<Vec<Document>> {
+        let cond = query.condition.as_ref().ok_or(SdbError::InvalidArg)?;
+        let node_id = match cond.get("NodeId") {
+            Some(Value::Int32(n)) => *n as u16,
+            _ => return Err(SdbError::InvalidArg),
+        };
+        let addr = match cond.get("Address") {
+            Some(Value::String(s)) => s.clone(),
+            _ => return Err(SdbError::InvalidArg),
+        };
+        let group_id = match cond.get("GroupId") {
+            Some(Value::Int32(n)) => *n as u32,
+            _ => {
+                // Default: same group as local node
+                match &self.election {
+                    Some(em) => em.lock().unwrap_or_else(|e| e.into_inner()).local_node.group_id,
+                    None => 1,
+                }
+            }
+        };
+
+        let peer_addr = NodeAddress { group_id, node_id };
+
+        // Add to election manager
+        if let Some(em) = &self.election {
+            let mut em = em.lock().unwrap_or_else(|e| e.into_inner());
+            em.add_peer(peer_addr);
+        }
+
+        // Add to replication agent
+        if let Some(agent) = &self.repl_agent {
+            if let Ok(mut ag) = agent.try_lock() {
+                ag.add_replica(peer_addr);
+                ag.peer_addrs.insert(node_id, addr.clone());
+            }
+        }
+
+        let mut doc = Document::new();
+        doc.insert("Added", Value::Boolean(true));
+        doc.insert("NodeId", Value::Int32(node_id as i32));
+        doc.insert("Address", Value::String(addr));
+        Ok(vec![doc])
+    }
+
+    fn cmd_remove_member(&self, query: &MsgOpQuery) -> Result<Vec<Document>> {
+        let cond = query.condition.as_ref().ok_or(SdbError::InvalidArg)?;
+        let node_id = match cond.get("NodeId") {
+            Some(Value::Int32(n)) => *n as u16,
+            _ => return Err(SdbError::InvalidArg),
+        };
+
+        // Remove from election manager
+        let removed_em = if let Some(em) = &self.election {
+            let mut em = em.lock().unwrap_or_else(|e| e.into_inner());
+            em.remove_peer(node_id)
+        } else {
+            false
+        };
+
+        // Remove from replication agent
+        if let Some(agent) = &self.repl_agent {
+            if let Ok(mut ag) = agent.try_lock() {
+                let _ = ag.remove_replica(node_id);
+                ag.peer_addrs.remove(&node_id);
+            }
+        }
+
+        let mut doc = Document::new();
+        doc.insert("Removed", Value::Boolean(removed_em));
+        doc.insert("NodeId", Value::Int32(node_id as i32));
+        Ok(vec![doc])
+    }
+
+    fn cmd_get_members(&self) -> Result<Vec<Document>> {
+        let mut docs = Vec::new();
+        if let Some(em) = &self.election {
+            let em = em.lock().unwrap_or_else(|e| e.into_inner());
+            // Add local node
+            let mut local = Document::new();
+            local.insert("NodeId", Value::Int32(em.local_node.node_id as i32));
+            local.insert("GroupId", Value::Int32(em.local_node.group_id as i32));
+            local.insert("State", Value::String(format!("{:?}", em.state)));
+            local.insert("IsSelf", Value::Boolean(true));
+            docs.push(local);
+            // Add peers
+            for peer in em.peer_list() {
+                let mut pdoc = Document::new();
+                pdoc.insert("NodeId", Value::Int32(peer.node_id as i32));
+                pdoc.insert("GroupId", Value::Int32(peer.group_id as i32));
+                pdoc.insert("IsSelf", Value::Boolean(false));
+                if let Some(agent) = &self.repl_agent {
+                    if let Ok(ag) = agent.try_lock() {
+                        if let Some(addr) = ag.peer_addrs.get(&peer.node_id) {
+                            pdoc.insert("Address", Value::String(addr.clone()));
+                        }
+                        if let Some(status) = ag.replicas.get(&peer.node_id) {
+                            pdoc.insert("SyncedLsn", Value::Int64(status.synced_lsn as i64));
+                            pdoc.insert("IsAlive", Value::Boolean(status.is_alive));
+                        }
+                    }
+                }
+                docs.push(pdoc);
+            }
+        }
+        Ok(docs)
+    }
+
     // ── Replication message handlers ────────────────────────────────
 
     fn handle_repl_sync(&self, header: &MsgHeader, payload: &[u8]) -> MsgOpReply {
@@ -1361,6 +1555,105 @@ impl DataNodeHandler {
         em.heartbeat_received(primary_id, term);
 
         MsgOpReply::ok(header.opcode, header.request_id, vec![])
+    }
+
+    // ── Dynamic Membership RPC handler ───────────────────────────────
+
+    fn handle_repl_member_change(&self, header: &MsgHeader, payload: &[u8]) -> MsgOpReply {
+        let doc = match Document::from_bytes(payload) {
+            Ok(d) => d,
+            Err(_) => return MsgOpReply::error(header.opcode, header.request_id, &SdbError::InvalidBson),
+        };
+
+        let action = match doc.get("action") {
+            Some(Value::String(s)) => s.clone(),
+            _ => return MsgOpReply::error(header.opcode, header.request_id, &SdbError::InvalidArg),
+        };
+        let node_id = match doc.get("node_id") {
+            Some(Value::Int32(n)) => *n as u16,
+            _ => return MsgOpReply::error(header.opcode, header.request_id, &SdbError::InvalidArg),
+        };
+        let group_id = match doc.get("group_id") {
+            Some(Value::Int32(n)) => *n as u32,
+            _ => 1,
+        };
+        let addr_str = match doc.get("address") {
+            Some(Value::String(s)) => Some(s.clone()),
+            _ => None,
+        };
+
+        match action.as_str() {
+            "add" => {
+                let peer = NodeAddress { group_id, node_id };
+                if let Some(em) = &self.election {
+                    let mut em = em.lock().unwrap_or_else(|e| e.into_inner());
+                    em.add_peer(peer);
+                }
+                if let (Some(agent), Some(addr)) = (&self.repl_agent, addr_str) {
+                    if let Ok(mut ag) = agent.try_lock() {
+                        ag.add_replica(peer);
+                        ag.peer_addrs.insert(node_id, addr);
+                    }
+                }
+            }
+            "remove" => {
+                if let Some(em) = &self.election {
+                    let mut em = em.lock().unwrap_or_else(|e| e.into_inner());
+                    em.remove_peer(node_id);
+                }
+                if let Some(agent) = &self.repl_agent {
+                    if let Ok(mut ag) = agent.try_lock() {
+                        let _ = ag.remove_replica(node_id);
+                        ag.peer_addrs.remove(&node_id);
+                    }
+                }
+            }
+            _ => return MsgOpReply::error(header.opcode, header.request_id, &SdbError::InvalidArg),
+        }
+
+        MsgOpReply::ok(header.opcode, header.request_id, vec![])
+    }
+
+    // ── Chunk Migration Data handler ────────────────────────────────
+
+    fn handle_chunk_migrate_data(&self, header: &MsgHeader, payload: &[u8]) -> MsgOpReply {
+        // Receive migrated documents and insert them into the local catalog.
+        // Payload: BSON doc { collection: String, docs: [Document] }
+        let doc = match Document::from_bytes(payload) {
+            Ok(d) => d,
+            Err(_) => return MsgOpReply::error(header.opcode, header.request_id, &SdbError::InvalidBson),
+        };
+
+        let collection = match doc.get("collection") {
+            Some(Value::String(s)) => s.clone(),
+            _ => return MsgOpReply::error(header.opcode, header.request_id, &SdbError::InvalidArg),
+        };
+        let docs = match doc.get("docs") {
+            Some(Value::Array(arr)) => arr.clone(),
+            _ => return MsgOpReply::error(header.opcode, header.request_id, &SdbError::InvalidArg),
+        };
+
+        let result = (|| -> Result<u64> {
+            let (cs, cl) = parse_collection_name(&collection)?;
+            let catalog = self.catalog.read().map_err(|_| SdbError::Sys)?;
+            let mut count = 0u64;
+            for val in &docs {
+                if let Value::Document(d) = val {
+                    catalog.insert_document(cs, cl, d)?;
+                    count += 1;
+                }
+            }
+            Ok(count)
+        })();
+
+        match result {
+            Ok(count) => {
+                let mut ack = Document::new();
+                ack.insert("inserted", Value::Int64(count as i64));
+                MsgOpReply::ok(header.opcode, header.request_id, vec![ack])
+            }
+            Err(e) => MsgOpReply::error(header.opcode, header.request_id, &e),
+        }
     }
 
     // ── Election background loop ────────────────────────────────────
@@ -1561,6 +1854,8 @@ impl MessageHandler for DataNodeHandler {
                 MsgOpReply::ok(header.opcode, header.request_id, vec![])
             }
             Some(OpCode::ReplHeartbeat) => self.handle_repl_heartbeat(&header, payload),
+            Some(OpCode::ReplMemberChange) => self.handle_repl_member_change(&header, payload),
+            Some(OpCode::ChunkMigrateData) => self.handle_chunk_migrate_data(&header, payload),
             _ => MsgOpReply::error(header.opcode, header.request_id, &SdbError::InvalidArg),
         };
 
@@ -1590,8 +1885,12 @@ impl MessageHandler for DataNodeHandler {
             let _ = mgr.abort(buffer.txn_id);
             tracing::info!("Auto-rolled back txn {} for disconnected client {}", buffer.txn_id, conn.addr);
         }
-        // Also remove from sessions
+        // Also remove from sessions and read preferences
         self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&conn.addr);
+        self.read_prefs
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&conn.addr);

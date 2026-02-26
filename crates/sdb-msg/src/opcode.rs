@@ -26,6 +26,8 @@ pub enum OpCode {
     ReplVoteReq = 4003,
     ReplVoteReply = 4004,
     ReplHeartbeat = 4005,
+    ReplMemberChange = 4006,
+    ChunkMigrateData = 4007,
 }
 
 /// Reply bit flag — OR'd with request opcode to form reply opcode (C++ convention).
@@ -57,6 +59,8 @@ impl OpCode {
             4003 => Some(Self::ReplVoteReq),
             4004 => Some(Self::ReplVoteReply),
             4005 => Some(Self::ReplHeartbeat),
+            4006 => Some(Self::ReplMemberChange),
+            4007 => Some(Self::ChunkMigrateData),
             _ => None,
         }
     }

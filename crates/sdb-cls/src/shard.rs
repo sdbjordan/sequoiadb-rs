@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use sdb_bson::{Document, Value};
 use sdb_common::{GroupId, Result, SdbError};
 
@@ -9,11 +11,24 @@ pub struct ShardRange {
     pub up_bound: Option<Value>,
 }
 
+/// Chunk metadata for tracking data distribution.
+#[derive(Debug, Clone)]
+pub struct ChunkInfo {
+    pub chunk_id: u32,
+    pub group_id: GroupId,
+    pub low_bound: Option<Value>,
+    pub up_bound: Option<Value>,
+    pub doc_count: u64,
+    pub migrating: bool,
+}
+
 /// Manages sharding — determines which group owns a given shard key range.
 pub struct ShardManager {
     pub shard_key: Option<String>,
     pub ranges: Vec<ShardRange>,
     pub num_groups: u32,
+    pub chunks: Vec<ChunkInfo>,
+    next_chunk_id: u32,
 }
 
 impl ShardManager {
@@ -22,6 +37,8 @@ impl ShardManager {
             shard_key: None,
             ranges: Vec::new(),
             num_groups: 1,
+            chunks: Vec::new(),
+            next_chunk_id: 1,
         }
     }
 
@@ -30,6 +47,20 @@ impl ShardManager {
         self.shard_key = Some(field.to_string());
         self.num_groups = num_groups.max(1);
         self.ranges.clear();
+        // Initialize one chunk per group
+        self.chunks.clear();
+        for gid in 1..=num_groups {
+            let chunk = ChunkInfo {
+                chunk_id: self.next_chunk_id,
+                group_id: gid,
+                low_bound: None,
+                up_bound: None,
+                doc_count: 0,
+                migrating: false,
+            };
+            self.next_chunk_id += 1;
+            self.chunks.push(chunk);
+        }
     }
 
     /// Configure range-based sharding with explicit boundaries.
@@ -90,6 +121,100 @@ impl ShardManager {
     fn hash_route(&self, val: &Value) -> GroupId {
         let h = simple_hash(val);
         (h % self.num_groups) + 1
+    }
+
+    /// Get chunk info for all chunks.
+    pub fn chunk_info(&self) -> &[ChunkInfo] {
+        &self.chunks
+    }
+
+    /// Get per-group document counts.
+    pub fn group_doc_counts(&self) -> HashMap<GroupId, u64> {
+        let mut counts = HashMap::new();
+        for chunk in &self.chunks {
+            *counts.entry(chunk.group_id).or_insert(0) += chunk.doc_count;
+        }
+        counts
+    }
+
+    /// Increment the doc count for the group that a document routes to.
+    pub fn record_insert(&mut self, group_id: GroupId) {
+        for chunk in &mut self.chunks {
+            if chunk.group_id == group_id {
+                chunk.doc_count += 1;
+                return;
+            }
+        }
+    }
+
+    /// Decrement doc count for the group.
+    pub fn record_delete(&mut self, group_id: GroupId, count: u64) {
+        for chunk in &mut self.chunks {
+            if chunk.group_id == group_id {
+                chunk.doc_count = chunk.doc_count.saturating_sub(count);
+                return;
+            }
+        }
+    }
+
+    /// Split a chunk: move some data from `source_group` to `target_group`.
+    /// Returns the new chunk_id assigned to the target group's chunk.
+    pub fn split_chunk(&mut self, source_group: GroupId, target_group: GroupId, doc_count_to_move: u64) -> Result<u32> {
+        // Find source chunk
+        let source = self.chunks.iter_mut().find(|c| c.group_id == source_group && !c.migrating);
+        let source = source.ok_or(SdbError::InvalidArg)?;
+        if source.doc_count < doc_count_to_move {
+            return Err(SdbError::InvalidArg);
+        }
+        source.doc_count -= doc_count_to_move;
+
+        // Find or create target chunk
+        let new_id = self.next_chunk_id;
+        self.next_chunk_id += 1;
+        if let Some(target) = self.chunks.iter_mut().find(|c| c.group_id == target_group) {
+            target.doc_count += doc_count_to_move;
+        } else {
+            self.chunks.push(ChunkInfo {
+                chunk_id: new_id,
+                group_id: target_group,
+                low_bound: None,
+                up_bound: None,
+                doc_count: doc_count_to_move,
+                migrating: false,
+            });
+        }
+        Ok(new_id)
+    }
+
+    /// Mark a chunk as migrating (prevents further splits).
+    pub fn set_migrating(&mut self, group_id: GroupId, migrating: bool) {
+        for chunk in &mut self.chunks {
+            if chunk.group_id == group_id {
+                chunk.migrating = migrating;
+            }
+        }
+    }
+
+    /// Find the most overloaded and least loaded groups for auto-balancing.
+    /// Returns Some((source_group, target_group, docs_to_move)) if imbalanced.
+    pub fn find_imbalance(&self) -> Option<(GroupId, GroupId, u64)> {
+        let counts = self.group_doc_counts();
+        if counts.len() < 2 {
+            return None;
+        }
+        let (&max_gid, &max_count) = counts.iter().max_by_key(|(_, c)| *c)?;
+        let (&min_gid, &min_count) = counts.iter().min_by_key(|(_, c)| *c)?;
+        if max_gid == min_gid {
+            return None;
+        }
+        let diff = max_count.saturating_sub(min_count);
+        // Only rebalance if the difference is > 20% of max
+        if diff > max_count / 5 && diff > 10 {
+            let to_move = diff / 2;
+            Some((max_gid, min_gid, to_move))
+        } else {
+            None
+        }
     }
 
     fn route_by_range(&self, val: &Value) -> Result<GroupId> {

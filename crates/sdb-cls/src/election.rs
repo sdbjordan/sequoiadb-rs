@@ -44,7 +44,21 @@ impl ElectionManager {
 
     /// Add a peer node to the replica group.
     pub fn add_peer(&mut self, node: NodeAddress) {
-        self.peers.push(node);
+        if !self.peers.iter().any(|p| p.node_id == node.node_id) {
+            self.peers.push(node);
+        }
+    }
+
+    /// Remove a peer from the replica group. Returns true if found and removed.
+    pub fn remove_peer(&mut self, node_id: NodeId) -> bool {
+        let before = self.peers.len();
+        self.peers.retain(|p| p.node_id != node_id);
+        self.peers.len() < before
+    }
+
+    /// Get the list of peer addresses.
+    pub fn peer_list(&self) -> &[NodeAddress] {
+        &self.peers
     }
 
     /// Start an election. The local node becomes a candidate.

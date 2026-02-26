@@ -35,3 +35,42 @@ pub struct NodeAddress {
     pub group_id: GroupId,
     pub node_id: NodeId,
 }
+
+/// Read preference for routing queries.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ReadPreference {
+    /// All reads go to primary (default).
+    #[default]
+    Primary,
+    /// Reads go to a secondary if available, else primary.
+    SecondaryPreferred,
+    /// Reads must go to a secondary; fail if none available.
+    Secondary,
+    /// Reads go to the node with lowest latency (not yet measured, acts as SecondaryPreferred).
+    Nearest,
+}
+
+impl ReadPreference {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "primary" => Some(Self::Primary),
+            "secondarypreferred" | "secondary_preferred" => Some(Self::SecondaryPreferred),
+            "secondary" => Some(Self::Secondary),
+            "nearest" => Some(Self::Nearest),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Primary => "Primary",
+            Self::SecondaryPreferred => "SecondaryPreferred",
+            Self::Secondary => "Secondary",
+            Self::Nearest => "Nearest",
+        }
+    }
+
+    pub fn allows_secondary(&self) -> bool {
+        matches!(self, Self::Secondary | Self::SecondaryPreferred | Self::Nearest)
+    }
+}

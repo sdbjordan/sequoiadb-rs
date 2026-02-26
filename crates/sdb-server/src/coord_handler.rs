@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use async_trait::async_trait;
 use sdb_bson::{Document, Value};
 use sdb_cls::ShardManager;
-use sdb_common::{GroupId, Result, SdbError};
+use sdb_common::{GroupId, ReadPreference, Result, SdbError};
 use sdb_coord::CoordRouter;
 use sdb_mon::Metrics;
 use sdb_msg::header::MsgHeader;
@@ -27,8 +27,12 @@ struct CoordTxnState {
 pub struct CoordNodeHandler {
     router: RwLock<CoordRouter>,
     pub(crate) clients: HashMap<GroupId, Arc<DataNodeClient>>,
+    /// Secondary clients per group (for read preference routing).
+    /// Map: group_id -> Vec<DataNodeClient> for secondary nodes.
+    pub(crate) secondary_clients: RwLock<HashMap<GroupId, Vec<Arc<DataNodeClient>>>>,
     cursors: StdMutex<CursorManager>,
     coord_txns: StdMutex<HashMap<SocketAddr, CoordTxnState>>,
+    read_prefs: StdMutex<HashMap<SocketAddr, ReadPreference>>,
     metrics: Arc<Metrics>,
 }
 
@@ -43,9 +47,51 @@ impl CoordNodeHandler {
         Self {
             router: RwLock::new(CoordRouter::new()),
             clients,
+            secondary_clients: RwLock::new(HashMap::new()),
             cursors: StdMutex::new(CursorManager::new()),
             coord_txns: StdMutex::new(HashMap::new()),
+            read_prefs: StdMutex::new(HashMap::new()),
             metrics: Arc::new(Metrics::new()),
+        }
+    }
+
+    /// Register a secondary node for a group (for read preference routing).
+    pub fn add_secondary(&self, group_id: GroupId, addr: String) {
+        let mut secs = self.secondary_clients.write().unwrap_or_else(|e| e.into_inner());
+        secs.entry(group_id).or_default().push(Arc::new(DataNodeClient::new(addr)));
+    }
+
+    /// Get read preference for a connection.
+    fn get_read_preference(&self, addr: &SocketAddr) -> ReadPreference {
+        self.read_prefs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(addr)
+            .copied()
+            .unwrap_or(ReadPreference::Primary)
+    }
+
+    /// Get the appropriate client for a group based on read preference.
+    fn get_client_for_read(&self, gid: GroupId, pref: ReadPreference) -> Option<Arc<DataNodeClient>> {
+        match pref {
+            ReadPreference::Primary => self.clients.get(&gid).cloned(),
+            ReadPreference::Secondary | ReadPreference::SecondaryPreferred | ReadPreference::Nearest => {
+                // Try secondary first
+                let secs = self.secondary_clients.read().unwrap_or_else(|e| e.into_inner());
+                if let Some(sec_list) = secs.get(&gid) {
+                    if !sec_list.is_empty() {
+                        // Round-robin: pick based on a simple counter
+                        let idx = gid as usize % sec_list.len();
+                        return Some(sec_list[idx].clone());
+                    }
+                }
+                // Fallback to primary for SecondaryPreferred/Nearest
+                if pref != ReadPreference::Secondary {
+                    self.clients.get(&gid).cloned()
+                } else {
+                    None // Strict secondary mode, no secondary available
+                }
+            }
         }
     }
 
@@ -69,20 +115,21 @@ impl CoordNodeHandler {
 
     // ── Query dispatch ──────────────────────────────────────────────
 
-    async fn handle_query(&self, header: &MsgHeader, payload: &[u8]) -> MsgOpReply {
+    async fn handle_query(&self, header: &MsgHeader, payload: &[u8], addr: &SocketAddr) -> MsgOpReply {
         let query = match MsgOpQuery::decode(header, payload) {
             Ok(q) => q,
             Err(e) => return MsgOpReply::error(header.opcode, header.request_id, &e),
         };
 
         if query.name.starts_with('$') {
-            self.handle_command(header, &query).await
+            self.handle_command(header, &query, addr).await
         } else {
-            self.handle_data_query(header, &query).await
+            let pref = self.get_read_preference(addr);
+            self.handle_data_query(header, &query, pref).await
         }
     }
 
-    async fn handle_command(&self, header: &MsgHeader, query: &MsgOpQuery) -> MsgOpReply {
+    async fn handle_command(&self, header: &MsgHeader, query: &MsgOpQuery, addr: &SocketAddr) -> MsgOpReply {
         let result = match query.name.as_str() {
             "$create collectionspace" => {
                 let name = get_string_field(query.condition.as_ref(), "Name");
@@ -120,6 +167,30 @@ impl CoordNodeHandler {
             },
             "$enable sharding" => self.cmd_enable_sharding(query),
             "$get shard info" => match self.cmd_get_shard_info(query) {
+                Ok(docs) => return MsgOpReply::ok(header.opcode, header.request_id, docs),
+                Err(e) => Err(e),
+            },
+            "$set read preference" => match self.cmd_set_read_preference(query, addr) {
+                Ok(docs) => return MsgOpReply::ok(header.opcode, header.request_id, docs),
+                Err(e) => Err(e),
+            },
+            "$get read preference" => match self.cmd_get_read_preference(addr) {
+                Ok(docs) => return MsgOpReply::ok(header.opcode, header.request_id, docs),
+                Err(e) => Err(e),
+            },
+            "$split chunk" => match self.cmd_split_chunk(query).await {
+                Ok(docs) => return MsgOpReply::ok(header.opcode, header.request_id, docs),
+                Err(e) => Err(e),
+            },
+            "$migrate chunk" => match self.cmd_migrate_chunk(query).await {
+                Ok(docs) => return MsgOpReply::ok(header.opcode, header.request_id, docs),
+                Err(e) => Err(e),
+            },
+            "$get chunk info" => match self.cmd_get_chunk_info(query) {
+                Ok(docs) => return MsgOpReply::ok(header.opcode, header.request_id, docs),
+                Err(e) => Err(e),
+            },
+            "$balance" => match self.cmd_balance(query).await {
                 Ok(docs) => return MsgOpReply::ok(header.opcode, header.request_id, docs),
                 Err(e) => Err(e),
             },
@@ -207,8 +278,8 @@ impl CoordNodeHandler {
 
     // ── Data query (scatter-gather) ─────────────────────────────────
 
-    async fn handle_data_query(&self, header: &MsgHeader, query: &MsgOpQuery) -> MsgOpReply {
-        let result = self.execute_scatter_query(query).await;
+    async fn handle_data_query(&self, header: &MsgHeader, query: &MsgOpQuery, pref: ReadPreference) -> MsgOpReply {
+        let result = self.execute_scatter_query_with_pref(query, pref).await;
         match result {
             Ok(docs) => {
                 self.metrics.inc_query();
@@ -225,6 +296,11 @@ impl CoordNodeHandler {
 
     /// Execute a query across relevant groups and merge results.
     pub async fn execute_scatter_query(&self, query: &MsgOpQuery) -> Result<Vec<Document>> {
+        self.execute_scatter_query_with_pref(query, ReadPreference::Primary).await
+    }
+
+    /// Execute a query with read preference across relevant groups.
+    pub async fn execute_scatter_query_with_pref(&self, query: &MsgOpQuery, pref: ReadPreference) -> Result<Vec<Document>> {
         let target_groups = {
             let router = self.router.read().map_err(|_| SdbError::Sys)?;
             let routed = router.route_query(&query.name, query.condition.as_ref())?;
@@ -253,7 +329,8 @@ impl CoordNodeHandler {
         let mut all_docs = Vec::new();
 
         for &gid in &target_groups {
-            let client = self.clients.get(&gid).ok_or(SdbError::NodeNotFound)?;
+            let client = self.get_client_for_read(gid, pref)
+                .ok_or(SdbError::NodeNotFound)?;
             let docs = client
                 .query(
                     &query.name,
@@ -296,8 +373,15 @@ impl CoordNodeHandler {
 
         let result = async {
             for (gid, docs) in grouped {
+                let doc_count = docs.len() as u64;
                 let client = self.clients.get(&gid).ok_or(SdbError::NodeNotFound)?;
                 client.insert(&msg.name, docs).await?;
+                // Track doc counts for chunk balancing
+                if let Ok(mut router) = self.router.write() {
+                    for _ in 0..doc_count {
+                        router.record_insert(&msg.name, gid);
+                    }
+                }
             }
             Ok::<(), SdbError>(())
         }
@@ -506,6 +590,166 @@ impl CoordNodeHandler {
         Ok(vec![result])
     }
 
+    // ── Read Preference ─────────────────────────────────────────────
+
+    fn cmd_set_read_preference(&self, query: &MsgOpQuery, addr: &SocketAddr) -> Result<Vec<Document>> {
+        let cond = query.condition.as_ref().ok_or(SdbError::InvalidArg)?;
+        let pref_str = match cond.get("Preference") {
+            Some(Value::String(s)) => s.clone(),
+            _ => return Err(SdbError::InvalidArg),
+        };
+        let pref = ReadPreference::parse(&pref_str).ok_or(SdbError::InvalidArg)?;
+        self.read_prefs.lock().unwrap_or_else(|e| e.into_inner())
+            .insert(*addr, pref);
+        let mut doc = Document::new();
+        doc.insert("ReadPreference", Value::String(pref.as_str().to_string()));
+        Ok(vec![doc])
+    }
+
+    fn cmd_get_read_preference(&self, addr: &SocketAddr) -> Result<Vec<Document>> {
+        let pref = self.get_read_preference(addr);
+        let mut doc = Document::new();
+        doc.insert("ReadPreference", Value::String(pref.as_str().to_string()));
+        Ok(vec![doc])
+    }
+
+    // ── Chunk Split/Migrate ──────────────────────────────────────────
+
+    async fn cmd_split_chunk(&self, query: &MsgOpQuery) -> Result<Vec<Document>> {
+        let cond = query.condition.as_ref().ok_or(SdbError::InvalidArg)?;
+        let collection = match cond.get("Collection") {
+            Some(Value::String(s)) => s.clone(),
+            _ => return Err(SdbError::InvalidArg),
+        };
+        let source = match cond.get("Source") {
+            Some(Value::Int32(n)) => *n as u32,
+            _ => return Err(SdbError::InvalidArg),
+        };
+        let target = match cond.get("Target") {
+            Some(Value::Int32(n)) => *n as u32,
+            _ => return Err(SdbError::InvalidArg),
+        };
+        let count = match cond.get("Count") {
+            Some(Value::Int64(n)) => *n as u64,
+            Some(Value::Int32(n)) => *n as u64,
+            _ => return Err(SdbError::InvalidArg),
+        };
+
+        // Perform the migration: read from source, write to target, update routing
+        self.migrate_data(&collection, source, target, count).await?;
+
+        // Update routing metadata
+        let new_chunk_id = {
+            let mut router = self.router.write().map_err(|_| SdbError::Sys)?;
+            router.split_chunk(&collection, source, target, count)?
+        };
+
+        let mut doc = Document::new();
+        doc.insert("Split", Value::Boolean(true));
+        doc.insert("NewChunkId", Value::Int32(new_chunk_id as i32));
+        doc.insert("Migrated", Value::Int64(count as i64));
+        Ok(vec![doc])
+    }
+
+    async fn cmd_migrate_chunk(&self, query: &MsgOpQuery) -> Result<Vec<Document>> {
+        // Same as split but explicit migrate semantics
+        self.cmd_split_chunk(query).await
+    }
+
+    fn cmd_get_chunk_info(&self, query: &MsgOpQuery) -> Result<Vec<Document>> {
+        let cond = query.condition.as_ref().ok_or(SdbError::InvalidArg)?;
+        let collection = match cond.get("Collection") {
+            Some(Value::String(s)) => s.clone(),
+            _ => return Err(SdbError::InvalidArg),
+        };
+        let router = self.router.read().map_err(|_| SdbError::Sys)?;
+        let chunks = router.chunk_info(&collection);
+        let mut docs = Vec::new();
+        for chunk in &chunks {
+            let mut doc = Document::new();
+            doc.insert("ChunkId", Value::Int32(chunk.chunk_id as i32));
+            doc.insert("GroupId", Value::Int32(chunk.group_id as i32));
+            doc.insert("DocCount", Value::Int64(chunk.doc_count as i64));
+            doc.insert("Migrating", Value::Boolean(chunk.migrating));
+            docs.push(doc);
+        }
+        Ok(docs)
+    }
+
+    async fn cmd_balance(&self, query: &MsgOpQuery) -> Result<Vec<Document>> {
+        let cond = query.condition.as_ref().ok_or(SdbError::InvalidArg)?;
+        let collection = match cond.get("Collection") {
+            Some(Value::String(s)) => s.clone(),
+            _ => return Err(SdbError::InvalidArg),
+        };
+
+        let imbalance = {
+            let router = self.router.read().map_err(|_| SdbError::Sys)?;
+            router.find_imbalance(&collection)
+        };
+
+        match imbalance {
+            Some((source, target, docs_to_move)) => {
+                self.migrate_data(&collection, source, target, docs_to_move).await?;
+                let mut router = self.router.write().map_err(|_| SdbError::Sys)?;
+                let _ = router.split_chunk(&collection, source, target, docs_to_move);
+
+                let mut doc = Document::new();
+                doc.insert("Balanced", Value::Boolean(true));
+                doc.insert("Source", Value::Int32(source as i32));
+                doc.insert("Target", Value::Int32(target as i32));
+                doc.insert("Moved", Value::Int64(docs_to_move as i64));
+                Ok(vec![doc])
+            }
+            None => {
+                let mut doc = Document::new();
+                doc.insert("Balanced", Value::Boolean(true));
+                doc.insert("Message", Value::String("Already balanced".into()));
+                Ok(vec![doc])
+            }
+        }
+    }
+
+    /// Migrate documents from source group to target group.
+    async fn migrate_data(&self, collection: &str, source: GroupId, target: GroupId, count: u64) -> Result<()> {
+        let source_client = self.clients.get(&source).ok_or(SdbError::NodeNotFound)?;
+        let target_client = self.clients.get(&target).ok_or(SdbError::NodeNotFound)?;
+
+        // Mark as migrating
+        {
+            let mut router = self.router.write().map_err(|_| SdbError::Sys)?;
+            router.set_migrating(collection, source, true);
+        }
+
+        // Read docs from source (get `count` docs)
+        let docs = source_client.query(
+            collection,
+            None,
+            None,
+            None,
+            0,
+            count as i64,
+        ).await?;
+
+        if !docs.is_empty() {
+            // Insert into target
+            target_client.insert(collection, docs.clone()).await?;
+
+            // Delete from source (by matching each doc)
+            for doc in &docs {
+                source_client.delete(collection, doc.clone()).await?;
+            }
+        }
+
+        // Clear migrating flag
+        {
+            let mut router = self.router.write().map_err(|_| SdbError::Sys)?;
+            router.set_migrating(collection, source, false);
+        }
+
+        Ok(())
+    }
+
     // ── Count ───────────────────────────────────────────────────────
 
     pub async fn cmd_count(&self, query: &MsgOpQuery) -> Result<Vec<Document>> {
@@ -544,7 +788,7 @@ impl MessageHandler for CoordNodeHandler {
         tracing::debug!("Coord received opcode {:?} from {}", opcode, addr);
 
         let reply = match opcode {
-            Some(OpCode::QueryReq) => self.handle_query(&header, payload).await,
+            Some(OpCode::QueryReq) => self.handle_query(&header, payload, &addr).await,
             Some(OpCode::InsertReq) => self.handle_insert(&header, payload).await,
             Some(OpCode::UpdateReq) => self.handle_update(&header, payload).await,
             Some(OpCode::DeleteReq) => self.handle_delete(&header, payload).await,
@@ -569,6 +813,7 @@ impl MessageHandler for CoordNodeHandler {
     async fn on_disconnect(&self, conn: &Connection) -> Result<()> {
         tracing::info!("Coord client disconnected: {}", conn.addr);
         self.metrics.dec_sessions();
+        self.read_prefs.lock().unwrap_or_else(|e| e.into_inner()).remove(&conn.addr);
         Ok(())
     }
 }

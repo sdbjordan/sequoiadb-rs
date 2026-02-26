@@ -1,6 +1,7 @@
 use sdb_bson::Document;
+use sdb_cls::shard::ChunkInfo;
 use sdb_cls::ShardManager;
-use sdb_common::{GroupId, Result};
+use sdb_common::{GroupId, Result, SdbError};
 
 /// Coordinator router — routes requests to the correct data groups.
 /// Uses a ShardManager to determine routing based on shard key.
@@ -56,6 +57,51 @@ impl CoordRouter {
         let sm = self.shard_managers.get(collection)?;
         let key = sm.shard_key.as_ref()?.clone();
         Some((key, sm.num_groups))
+    }
+
+    /// Get chunk info for a collection.
+    pub fn chunk_info(&self, collection: &str) -> Vec<ChunkInfo> {
+        match self.shard_managers.get(collection) {
+            Some(sm) => sm.chunk_info().to_vec(),
+            None => vec![],
+        }
+    }
+
+    /// Record an insert to a group for chunk tracking.
+    pub fn record_insert(&mut self, collection: &str, group_id: GroupId) {
+        if let Some(sm) = self.shard_managers.get_mut(collection) {
+            sm.record_insert(group_id);
+        }
+    }
+
+    /// Record deletes from a group for chunk tracking.
+    pub fn record_delete(&mut self, collection: &str, group_id: GroupId, count: u64) {
+        if let Some(sm) = self.shard_managers.get_mut(collection) {
+            sm.record_delete(group_id, count);
+        }
+    }
+
+    /// Split a chunk: move docs from source to target group.
+    pub fn split_chunk(&mut self, collection: &str, source: GroupId, target: GroupId, docs_to_move: u64) -> Result<u32> {
+        let sm = self.shard_managers.get_mut(collection).ok_or(SdbError::CollectionNotFound)?;
+        sm.split_chunk(source, target, docs_to_move)
+    }
+
+    /// Set migrating flag on a chunk.
+    pub fn set_migrating(&mut self, collection: &str, group_id: GroupId, migrating: bool) {
+        if let Some(sm) = self.shard_managers.get_mut(collection) {
+            sm.set_migrating(group_id, migrating);
+        }
+    }
+
+    /// Find imbalance for a collection. Returns (source, target, docs_to_move).
+    pub fn find_imbalance(&self, collection: &str) -> Option<(GroupId, GroupId, u64)> {
+        self.shard_managers.get(collection)?.find_imbalance()
+    }
+
+    /// Get all sharded collection names.
+    pub fn sharded_collections(&self) -> Vec<String> {
+        self.shard_managers.keys().cloned().collect()
     }
 }
 

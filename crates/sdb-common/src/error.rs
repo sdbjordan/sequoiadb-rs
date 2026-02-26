@@ -61,6 +61,10 @@ pub enum SdbError {
     IndexAlreadyExists,
     #[error("Task not found")]
     TaskNotFound,
+    #[error("Chunk is migrating")]
+    ChunkMigrating,
+    #[error("Not secondary")]
+    NotSecondary,
 }
 
 pub type Result<T> = std::result::Result<T, SdbError>;

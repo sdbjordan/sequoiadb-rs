@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use sdb_bson::{Document, Value};
 use sdb_cat::CatalogManager;
 use sdb_cls::election::ElectionState;
-use sdb_common::NodeAddress;
+use sdb_common::{NodeAddress, ReadPreference};
 use sdb_dps::WriteAheadLog;
 use sdb_msg::header::MsgHeader;
 use sdb_msg::opcode::OpCode;
@@ -1877,4 +1877,539 @@ async fn election_after_primary_drop() {
 
     // Node 3 should not be primary
     assert!(h3.check_primary().is_err(), "node 3 should not be primary");
+}
+
+// ── Tier 2: Read Preference tests ───────────────────────────────
+
+fn set_read_pref_msg(request_id: u64, pref: &str) -> Vec<u8> {
+    let mut cond = Document::new();
+    cond.insert("Preference", Value::String(pref.into()));
+    MsgOpQuery::new(request_id, "$set read preference", Some(cond), None, None, None, 0, -1, 0)
+        .encode()
+}
+
+fn get_read_pref_msg(request_id: u64) -> Vec<u8> {
+    MsgOpQuery::new(request_id, "$get read preference", None, None, None, None, 0, -1, 0)
+        .encode()
+}
+
+fn get_members_msg(request_id: u64) -> Vec<u8> {
+    MsgOpQuery::new(request_id, "$get members", None, None, None, None, 0, -1, 0)
+        .encode()
+}
+
+fn add_member_msg(request_id: u64, node_id: u16, address: &str) -> Vec<u8> {
+    let mut cond = Document::new();
+    cond.insert("NodeId", Value::Int32(node_id as i32));
+    cond.insert("Address", Value::String(address.into()));
+    MsgOpQuery::new(request_id, "$add member", Some(cond), None, None, None, 0, -1, 0)
+        .encode()
+}
+
+fn remove_member_msg(request_id: u64, node_id: u16) -> Vec<u8> {
+    let mut cond = Document::new();
+    cond.insert("NodeId", Value::Int32(node_id as i32));
+    MsgOpQuery::new(request_id, "$remove member", Some(cond), None, None, None, 0, -1, 0)
+        .encode()
+}
+
+fn get_chunk_info_msg(request_id: u64, collection: &str) -> Vec<u8> {
+    let mut cond = Document::new();
+    cond.insert("Collection", Value::String(collection.into()));
+    MsgOpQuery::new(request_id, "$get chunk info", Some(cond), None, None, None, 0, -1, 0)
+        .encode()
+}
+
+fn split_chunk_msg(request_id: u64, collection: &str, source: u32, target: u32, count: u64) -> Vec<u8> {
+    let mut cond = Document::new();
+    cond.insert("Collection", Value::String(collection.into()));
+    cond.insert("Source", Value::Int32(source as i32));
+    cond.insert("Target", Value::Int32(target as i32));
+    cond.insert("Count", Value::Int64(count as i64));
+    MsgOpQuery::new(request_id, "$split chunk", Some(cond), None, None, None, 0, -1, 0)
+        .encode()
+}
+
+fn balance_msg(request_id: u64, collection: &str) -> Vec<u8> {
+    let mut cond = Document::new();
+    cond.insert("Collection", Value::String(collection.into()));
+    MsgOpQuery::new(request_id, "$balance", Some(cond), None, None, None, 0, -1, 0)
+        .encode()
+}
+
+#[tokio::test]
+async fn set_and_get_read_preference() {
+    let port = start_test_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .await
+        .unwrap();
+
+    // Default should be Primary
+    let reply = send_recv(&mut stream, &get_read_pref_msg(1)).await;
+    assert_eq!(reply.flags, 0);
+    assert_eq!(
+        reply.docs[0].get("ReadPreference"),
+        Some(&Value::String("Primary".into()))
+    );
+
+    // Set to SecondaryPreferred
+    let reply = send_recv(&mut stream, &set_read_pref_msg(2, "SecondaryPreferred")).await;
+    assert_eq!(reply.flags, 0);
+    assert_eq!(
+        reply.docs[0].get("ReadPreference"),
+        Some(&Value::String("SecondaryPreferred".into()))
+    );
+
+    // Verify it stuck
+    let reply = send_recv(&mut stream, &get_read_pref_msg(3)).await;
+    assert_eq!(reply.flags, 0);
+    assert_eq!(
+        reply.docs[0].get("ReadPreference"),
+        Some(&Value::String("SecondaryPreferred".into()))
+    );
+}
+
+#[tokio::test]
+async fn read_preference_secondary_allows_reads_on_secondary() {
+    let (port, handler) = start_repl_data_node(1, 1, vec![]).await;
+
+    // Force to secondary
+    {
+        let em = handler.election().as_ref().unwrap();
+        let mut em = em.lock().unwrap();
+        em.state = ElectionState::Secondary;
+    }
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .await
+        .unwrap();
+
+    // Create CS/CL while still primary-ish (we'll set secondary after)
+    // Actually, force back to primary for DDL
+    {
+        let em = handler.election().as_ref().unwrap();
+        let mut em = em.lock().unwrap();
+        em.start_election().unwrap();
+    }
+    send_recv(&mut stream, &create_cs_msg(1, "rpcs")).await;
+    send_recv(&mut stream, &create_cl_msg(2, "rpcs.cl")).await;
+    send_recv(
+        &mut stream,
+        &insert_msg(3, "rpcs.cl", vec![doc(&[("x", Value::Int32(1))])]),
+    ).await;
+
+    // Now force to secondary
+    {
+        let em = handler.election().as_ref().unwrap();
+        let mut em = em.lock().unwrap();
+        em.state = ElectionState::Secondary;
+    }
+
+    // Query with default read pref (Primary) should fail
+    let reply = send_recv(&mut stream, &query_msg(4, "rpcs.cl", None)).await;
+    assert!(reply.flags < 0, "query should fail on secondary with Primary read pref");
+
+    // Set read preference to Secondary
+    let reply = send_recv(&mut stream, &set_read_pref_msg(5, "Secondary")).await;
+    assert_eq!(reply.flags, 0);
+
+    // Now query should succeed on secondary
+    let reply = send_recv(&mut stream, &query_msg(6, "rpcs.cl", None)).await;
+    assert_eq!(reply.flags, 0, "query should succeed with Secondary read pref");
+    assert_eq!(reply.docs.len(), 1);
+    assert_eq!(reply.docs[0].get("x"), Some(&Value::Int32(1)));
+}
+
+#[tokio::test]
+async fn read_preference_primary_rejects_on_secondary() {
+    let (port, handler) = start_repl_data_node(1, 1, vec![]).await;
+
+    // Force to secondary
+    {
+        let em = handler.election().as_ref().unwrap();
+        let mut em = em.lock().unwrap();
+        em.state = ElectionState::Secondary;
+    }
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .await
+        .unwrap();
+
+    // With default Primary preference, query should fail
+    let reply = send_recv(&mut stream, &query_msg(1, "nonexist.cl", None)).await;
+    assert!(reply.flags < 0, "query with Primary pref should fail on secondary");
+}
+
+#[tokio::test]
+async fn coord_read_preference_set_get() {
+    let port = start_coord_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .await
+        .unwrap();
+
+    // Set read preference at coord level
+    let reply = send_recv(&mut stream, &set_read_pref_msg(1, "Secondary")).await;
+    assert_eq!(reply.flags, 0);
+    assert_eq!(
+        reply.docs[0].get("ReadPreference"),
+        Some(&Value::String("Secondary".into()))
+    );
+
+    // Get read preference
+    let reply = send_recv(&mut stream, &get_read_pref_msg(2)).await;
+    assert_eq!(reply.flags, 0);
+    assert_eq!(
+        reply.docs[0].get("ReadPreference"),
+        Some(&Value::String("Secondary".into()))
+    );
+}
+
+// ── Tier 2: Dynamic Membership tests ────────────────────────────
+
+#[tokio::test]
+async fn dynamic_add_member() {
+    let addr1 = NodeAddress { group_id: 1, node_id: 1 };
+    let (port, h1) = start_repl_data_node(1, 1, vec![]).await;
+
+    // Start with 0 peers
+    {
+        let em = h1.election().as_ref().unwrap();
+        let em = em.lock().unwrap();
+        assert_eq!(em.peer_list().len(), 0);
+    }
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .await
+        .unwrap();
+
+    // Add a member via command
+    let reply = send_recv(&mut stream, &add_member_msg(1, 2, "127.0.0.1:19950")).await;
+    assert_eq!(reply.flags, 0);
+    assert_eq!(reply.docs[0].get("Added"), Some(&Value::Boolean(true)));
+
+    // Verify peer was added
+    {
+        let em = h1.election().as_ref().unwrap();
+        let em = em.lock().unwrap();
+        assert_eq!(em.peer_list().len(), 1);
+        assert_eq!(em.peer_list()[0].node_id, 2);
+    }
+
+    // Verify repl_agent also has the peer
+    {
+        let agent = h1.repl_agent().as_ref().unwrap();
+        let ag = agent.try_lock().unwrap();
+        assert!(ag.replicas.contains_key(&2));
+        assert_eq!(ag.peer_addrs.get(&2), Some(&"127.0.0.1:19950".to_string()));
+    }
+}
+
+#[tokio::test]
+async fn dynamic_remove_member() {
+    let addr2 = NodeAddress { group_id: 1, node_id: 2 };
+    let (port, h1) = start_repl_data_node(
+        1, 1,
+        vec![(addr2, "127.0.0.1:19951".into())],
+    ).await;
+
+    // Should have 1 peer
+    {
+        let em = h1.election().as_ref().unwrap();
+        let em = em.lock().unwrap();
+        assert_eq!(em.peer_list().len(), 1);
+    }
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .await
+        .unwrap();
+
+    // Remove member
+    let reply = send_recv(&mut stream, &remove_member_msg(1, 2)).await;
+    assert_eq!(reply.flags, 0);
+    assert_eq!(reply.docs[0].get("Removed"), Some(&Value::Boolean(true)));
+
+    // Verify peer was removed
+    {
+        let em = h1.election().as_ref().unwrap();
+        let em = em.lock().unwrap();
+        assert_eq!(em.peer_list().len(), 0);
+    }
+}
+
+#[tokio::test]
+async fn get_members_returns_local_and_peers() {
+    let addr2 = NodeAddress { group_id: 1, node_id: 2 };
+    let addr3 = NodeAddress { group_id: 1, node_id: 3 };
+    let (port, h1) = start_repl_data_node(
+        1, 1,
+        vec![
+            (addr2, "127.0.0.1:19952".into()),
+            (addr3, "127.0.0.1:19953".into()),
+        ],
+    ).await;
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .await
+        .unwrap();
+
+    let reply = send_recv(&mut stream, &get_members_msg(1)).await;
+    assert_eq!(reply.flags, 0);
+    assert_eq!(reply.docs.len(), 3, "should return local + 2 peers");
+
+    // Local node should have IsSelf=true
+    let local = reply.docs.iter().find(|d| d.get("IsSelf") == Some(&Value::Boolean(true)));
+    assert!(local.is_some(), "should have local node");
+    assert_eq!(local.unwrap().get("NodeId"), Some(&Value::Int32(1)));
+}
+
+#[tokio::test]
+async fn dynamic_add_then_election_works() {
+    // Start node 1 with no peers
+    let (_, h1) = start_repl_data_node(1, 1, vec![]).await;
+    let (_, h2) = start_repl_data_node(1, 2, vec![]).await;
+
+    // Dynamically add node 2 to node 1's peer list
+    {
+        let em = h1.election().as_ref().unwrap();
+        let mut em = em.lock().unwrap();
+        em.add_peer(NodeAddress { group_id: 1, node_id: 2 });
+    }
+
+    // Node 1 starts election (2 nodes, needs 2/2 = 2 votes)
+    {
+        let em = h1.election().as_ref().unwrap();
+        let mut em = em.lock().unwrap();
+        em.start_election().unwrap();
+        assert_eq!(em.state, ElectionState::Candidate);
+    }
+
+    // Node 2 grants vote
+    let granted = {
+        let em = h2.election().as_ref().unwrap();
+        let mut em = em.lock().unwrap();
+        em.should_grant_vote(1, 1, 0)
+    };
+    assert!(granted);
+
+    // Deliver vote
+    {
+        let em = h1.election().as_ref().unwrap();
+        let mut em = em.lock().unwrap();
+        em.receive_vote(2).unwrap();
+    }
+    assert!(h1.check_primary().is_ok());
+}
+
+// ── Tier 2: Chunk Split/Migrate tests ───────────────────────────
+
+#[tokio::test]
+async fn get_chunk_info_after_sharding() {
+    let port = start_coord_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .await
+        .unwrap();
+
+    send_recv(&mut stream, &create_cs_msg(1, "chcs")).await;
+    send_recv(&mut stream, &create_cl_msg(2, "chcs.cl")).await;
+
+    // Before sharding: no chunks
+    let reply = send_recv(&mut stream, &get_chunk_info_msg(3, "chcs.cl")).await;
+    assert_eq!(reply.flags, 0);
+    assert_eq!(reply.docs.len(), 0, "no chunks before sharding");
+
+    // Enable sharding with 3 groups
+    send_recv(&mut stream, &enable_sharding_msg(4, "chcs.cl", "x", 3)).await;
+
+    // After sharding: 3 chunks (one per group)
+    let reply = send_recv(&mut stream, &get_chunk_info_msg(5, "chcs.cl")).await;
+    assert_eq!(reply.flags, 0);
+    assert_eq!(reply.docs.len(), 3, "should have 3 chunks after sharding");
+
+    // Each chunk should have GroupId 1, 2, or 3
+    let mut group_ids: Vec<i32> = reply.docs.iter()
+        .filter_map(|d| match d.get("GroupId") {
+            Some(Value::Int32(n)) => Some(*n),
+            _ => None,
+        })
+        .collect();
+    group_ids.sort();
+    assert_eq!(group_ids, vec![1, 2, 3]);
+}
+
+#[tokio::test]
+async fn split_chunk_moves_data() {
+    let port = start_coord_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .await
+        .unwrap();
+
+    send_recv(&mut stream, &create_cs_msg(1, "spcs")).await;
+    send_recv(&mut stream, &create_cl_msg(2, "spcs.cl")).await;
+
+    // Enable sharding FIRST
+    send_recv(&mut stream, &enable_sharding_msg(3, "spcs.cl", "v", 3)).await;
+
+    // Insert 30 docs — sharding distributes them across groups
+    for i in 0..30 {
+        let docs = vec![doc(&[("v", Value::Int32(i))])];
+        send_recv(&mut stream, &insert_msg((10 + i) as u64, "spcs.cl", docs)).await;
+    }
+
+    // Check chunks have data now
+    let reply = send_recv(&mut stream, &get_chunk_info_msg(50, "spcs.cl")).await;
+    assert_eq!(reply.flags, 0);
+
+    // Find the group with the most docs for the split source
+    let mut max_group = 1u32;
+    let mut max_count = 0i64;
+    for d in &reply.docs {
+        let gid = match d.get("GroupId") {
+            Some(Value::Int32(n)) => *n as u32,
+            _ => continue,
+        };
+        let cnt = match d.get("DocCount") {
+            Some(Value::Int64(n)) => *n,
+            _ => 0,
+        };
+        if cnt > max_count {
+            max_count = cnt;
+            max_group = gid;
+        }
+    }
+
+    // Only split if there's something to split
+    if max_count >= 2 {
+        let target_group = if max_group == 1 { 2 } else { 1 };
+        let to_move = (max_count / 2) as u64;
+        let reply = send_recv(
+            &mut stream,
+            &split_chunk_msg(51, "spcs.cl", max_group, target_group, to_move),
+        ).await;
+        assert_eq!(reply.flags, 0, "split should succeed");
+        assert_eq!(reply.docs[0].get("Split"), Some(&Value::Boolean(true)));
+    }
+}
+
+#[tokio::test]
+async fn balance_already_balanced() {
+    let port = start_coord_server().await;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .await
+        .unwrap();
+
+    send_recv(&mut stream, &create_cs_msg(1, "balcs")).await;
+    send_recv(&mut stream, &create_cl_msg(2, "balcs.cl")).await;
+    send_recv(&mut stream, &enable_sharding_msg(3, "balcs.cl", "x", 3)).await;
+
+    // No data = already balanced
+    let reply = send_recv(&mut stream, &balance_msg(4, "balcs.cl")).await;
+    assert_eq!(reply.flags, 0);
+    assert_eq!(reply.docs[0].get("Balanced"), Some(&Value::Boolean(true)));
+}
+
+// ── ReadPreference enum unit tests ──────────────────────────────
+
+#[test]
+fn read_preference_from_str() {
+    assert_eq!(ReadPreference::parse("Primary"), Some(ReadPreference::Primary));
+    assert_eq!(ReadPreference::parse("Secondary"), Some(ReadPreference::Secondary));
+    assert_eq!(ReadPreference::parse("SecondaryPreferred"), Some(ReadPreference::SecondaryPreferred));
+    assert_eq!(ReadPreference::parse("Nearest"), Some(ReadPreference::Nearest));
+    assert_eq!(ReadPreference::parse("invalid"), None);
+}
+
+#[test]
+fn read_preference_allows_secondary() {
+    assert!(!ReadPreference::Primary.allows_secondary());
+    assert!(ReadPreference::Secondary.allows_secondary());
+    assert!(ReadPreference::SecondaryPreferred.allows_secondary());
+    assert!(ReadPreference::Nearest.allows_secondary());
+}
+
+// ── ShardManager chunk tracking unit tests ──────────────────────
+
+#[test]
+fn shard_manager_chunk_tracking() {
+    use sdb_cls::ShardManager;
+    let mut sm = ShardManager::new();
+    sm.set_hash_sharding("x", 3);
+    assert_eq!(sm.chunk_info().len(), 3);
+
+    // Record some inserts
+    sm.record_insert(1);
+    sm.record_insert(1);
+    sm.record_insert(2);
+    let counts = sm.group_doc_counts();
+    assert_eq!(counts.get(&1), Some(&2));
+    assert_eq!(counts.get(&2), Some(&1));
+    assert_eq!(counts.get(&3), Some(&0));
+}
+
+#[test]
+fn shard_manager_split_chunk() {
+    use sdb_cls::ShardManager;
+    let mut sm = ShardManager::new();
+    sm.set_hash_sharding("x", 2);
+
+    // Give group 1 100 docs
+    for _ in 0..100 {
+        sm.record_insert(1);
+    }
+
+    // Split 50 from group 1 to group 2
+    let result = sm.split_chunk(1, 2, 50);
+    assert!(result.is_ok());
+
+    let counts = sm.group_doc_counts();
+    assert_eq!(counts.get(&1), Some(&50));
+    assert_eq!(counts.get(&2), Some(&50));
+}
+
+#[test]
+fn shard_manager_find_imbalance() {
+    use sdb_cls::ShardManager;
+    let mut sm = ShardManager::new();
+    sm.set_hash_sharding("x", 2);
+
+    // No imbalance initially
+    assert!(sm.find_imbalance().is_none());
+
+    // Create imbalance: 100 vs 0
+    for _ in 0..100 {
+        sm.record_insert(1);
+    }
+
+    let imbalance = sm.find_imbalance();
+    assert!(imbalance.is_some());
+    let (source, target, to_move) = imbalance.unwrap();
+    assert_eq!(source, 1);
+    assert_eq!(target, 2);
+    assert!(to_move > 0);
+}
+
+// ── Election remove_peer test ───────────────────────────────────
+
+#[test]
+fn election_remove_peer() {
+    use sdb_cls::election::ElectionManager;
+    let mut em = ElectionManager::new(NodeAddress { group_id: 1, node_id: 1 });
+    em.add_peer(NodeAddress { group_id: 1, node_id: 2 });
+    em.add_peer(NodeAddress { group_id: 1, node_id: 3 });
+    assert_eq!(em.peer_list().len(), 2);
+
+    assert!(em.remove_peer(2));
+    assert_eq!(em.peer_list().len(), 1);
+    assert_eq!(em.peer_list()[0].node_id, 3);
+
+    // Remove non-existent
+    assert!(!em.remove_peer(99));
+}
+
+#[test]
+fn election_add_peer_no_duplicates() {
+    use sdb_cls::election::ElectionManager;
+    let mut em = ElectionManager::new(NodeAddress { group_id: 1, node_id: 1 });
+    em.add_peer(NodeAddress { group_id: 1, node_id: 2 });
+    em.add_peer(NodeAddress { group_id: 1, node_id: 2 }); // duplicate
+    assert_eq!(em.peer_list().len(), 1);
 }
