@@ -12,6 +12,7 @@ sdb-net = { workspace = true }
 sdb-msg = { workspace = true }
 sdb-dms = { workspace = true }
 sdb-dps = { workspace = true }
+sdb-mth = { workspace = true }
 sdb-rtn = { workspace = true }
 sdb-cat = { workspace = true }
 async-trait = { workspace = true }

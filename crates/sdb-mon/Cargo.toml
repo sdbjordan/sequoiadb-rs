@@ -6,5 +6,6 @@ license.workspace = true
 description = "Monitoring and diagnostics"
 
 [dependencies]
+sdb-bson = { workspace = true }
 sdb-common = { workspace = true }
 tracing = { workspace = true }
