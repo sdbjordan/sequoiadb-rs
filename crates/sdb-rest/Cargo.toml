@@ -1,0 +1,24 @@
+[package]
+name = "sdb-rest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "REST API gateway and Web UI for SequoiaDB-RS"
+
+[[bin]]
+name = "sdb-rest"
+path = "src/main.rs"
+
+[dependencies]
+sdb-client = { workspace = true }
+sdb-bson = { workspace = true }
+sdb-common = { workspace = true }
+axum = "0.8"
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = "1"
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tower-http = { version = "0.6", features = ["cors"] }
+base64 = "0.22"

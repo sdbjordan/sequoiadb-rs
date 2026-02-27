@@ -20,6 +20,7 @@ members = [
     "crates/sdb-sched",
     "crates/sdb-client",
     "crates/sdb-server",
+    "crates/sdb-rest",
 ]
 resolver = "2"
 
@@ -56,6 +57,7 @@ sdb-coord = { path = "crates/sdb-coord" }
 # Layer 5
 sdb-client = { path = "crates/sdb-client" }
 sdb-server = { path = "crates/sdb-server" }
+sdb-rest = { path = "crates/sdb-rest" }
 
 # Third-party
 tokio = { version = "1", features = ["full"] }

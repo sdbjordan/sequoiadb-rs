@@ -1,0 +1,376 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SequoiaDB-RS Console</title>
+<style>
+  :root {
+    --bg: #1a1a2e; --surface: #16213e; --surface2: #0f3460;
+    --accent: #e94560; --text: #eee; --text2: #aaa;
+    --border: #333; --success: #4caf50; --error: #f44336;
+    --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: var(--font); background: var(--bg); color: var(--text); height: 100vh; display: flex; flex-direction: column; }
+  header { background: var(--surface); padding: 10px 20px; display: flex; align-items: center; gap: 16px; border-bottom: 1px solid var(--border); }
+  header h1 { font-size: 16px; color: var(--accent); white-space: nowrap; }
+  #status-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--error); }
+  #status-dot.ok { background: var(--success); }
+  .main { display: flex; flex: 1; overflow: hidden; }
+  /* Sidebar */
+  .sidebar { width: 260px; min-width: 200px; background: var(--surface); border-right: 1px solid var(--border); overflow-y: auto; padding: 8px 0; }
+  .sidebar .cs-item { padding: 0; }
+  .cs-header { padding: 6px 12px; cursor: pointer; font-weight: 600; font-size: 13px; color: var(--text); display: flex; align-items: center; gap: 6px; }
+  .cs-header:hover { background: var(--surface2); }
+  .cs-header .arrow { font-size: 10px; transition: transform 0.15s; display: inline-block; }
+  .cs-header .arrow.open { transform: rotate(90deg); }
+  .cl-list { display: none; padding-left: 20px; }
+  .cl-list.open { display: block; }
+  .cl-item { padding: 4px 12px; cursor: pointer; font-size: 12px; color: var(--text2); }
+  .cl-item:hover, .cl-item.active { background: var(--surface2); color: var(--text); }
+  .sidebar-actions { padding: 8px 12px; border-bottom: 1px solid var(--border); display: flex; gap: 6px; }
+  .sidebar-actions button { font-size: 11px; }
+  /* Content */
+  .content { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+  /* SQL bar */
+  .sql-bar { padding: 10px; background: var(--surface); border-bottom: 1px solid var(--border); display: flex; gap: 8px; }
+  .sql-bar input { flex: 1; background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 6px 10px; font-size: 13px; font-family: var(--font); border-radius: 4px; }
+  .sql-bar input:focus { outline: none; border-color: var(--accent); }
+  /* Toolbar */
+  .toolbar { padding: 8px 10px; display: flex; gap: 8px; align-items: center; background: var(--surface); border-bottom: 1px solid var(--border); }
+  .toolbar .path { font-size: 13px; color: var(--text2); flex: 1; }
+  .toolbar input { background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 4px 8px; font-size: 12px; border-radius: 4px; width: 240px; }
+  /* Documents area */
+  .doc-area { flex: 1; overflow-y: auto; padding: 10px; }
+  .doc-card { background: var(--surface); border: 1px solid var(--border); border-radius: 4px; margin-bottom: 8px; overflow: hidden; }
+  .doc-card pre { padding: 10px; font-size: 12px; white-space: pre-wrap; word-break: break-all; line-height: 1.5; }
+  .doc-card .doc-actions { padding: 4px 10px; background: var(--surface2); display: flex; justify-content: flex-end; gap: 6px; }
+  .pager { padding: 10px; display: flex; gap: 8px; align-items: center; justify-content: center; font-size: 13px; }
+  /* Insert modal */
+  .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 100; align-items: center; justify-content: center; }
+  .modal-overlay.show { display: flex; }
+  .modal { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; width: 520px; max-height: 80vh; display: flex; flex-direction: column; }
+  .modal-header { padding: 12px 16px; font-weight: 600; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
+  .modal-body { padding: 16px; flex: 1; overflow-y: auto; }
+  .modal-body textarea { width: 100%; height: 200px; background: var(--bg); color: var(--text); border: 1px solid var(--border); font-family: var(--font); font-size: 13px; padding: 10px; border-radius: 4px; resize: vertical; }
+  .modal-footer { padding: 12px 16px; border-top: 1px solid var(--border); display: flex; justify-content: flex-end; gap: 8px; }
+  /* Result panel for SQL */
+  .result-panel { padding: 10px; overflow-y: auto; }
+  .result-panel pre { background: var(--surface); border: 1px solid var(--border); padding: 10px; border-radius: 4px; font-size: 12px; white-space: pre-wrap; max-height: 400px; overflow-y: auto; }
+  /* Buttons */
+  button { background: var(--surface2); color: var(--text); border: 1px solid var(--border); padding: 5px 12px; border-radius: 4px; cursor: pointer; font-size: 12px; font-family: var(--font); }
+  button:hover { background: var(--accent); border-color: var(--accent); }
+  button.danger { color: var(--error); }
+  button.danger:hover { background: var(--error); color: #fff; }
+  button.primary { background: var(--accent); border-color: var(--accent); }
+  /* Toast */
+  .toast { position: fixed; bottom: 20px; right: 20px; background: var(--surface2); border: 1px solid var(--border); padding: 10px 16px; border-radius: 6px; font-size: 13px; z-index: 200; transition: opacity 0.3s; }
+  .toast.error { border-color: var(--error); }
+  .toast.success { border-color: var(--success); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>SequoiaDB-RS</h1>
+  <div id="status-dot" title="Disconnected"></div>
+  <span id="status-text" style="font-size:12px;color:var(--text2)">Checking...</span>
+</header>
+
+<div class="main">
+  <!-- Sidebar -->
+  <div class="sidebar">
+    <div class="sidebar-actions">
+      <button onclick="promptCreateCS()">+ Space</button>
+      <button onclick="refreshTree()">Refresh</button>
+    </div>
+    <div id="tree"></div>
+  </div>
+
+  <!-- Content -->
+  <div class="content">
+    <!-- SQL bar -->
+    <div class="sql-bar">
+      <input id="sql-input" placeholder="SQL: e.g. select * from cs.cl where age > 25" onkeydown="if(event.key==='Enter')execSql()">
+      <button onclick="execSql()">Execute</button>
+    </div>
+
+    <!-- Toolbar (visible when collection selected) -->
+    <div class="toolbar" id="doc-toolbar" style="display:none">
+      <span class="path" id="current-path"></span>
+      <input id="filter-input" placeholder='Filter: {"age":{"$gt":25}}' onkeydown="if(event.key==='Enter')loadDocs()">
+      <button onclick="loadDocs()">Query</button>
+      <button class="primary" onclick="showInsertModal()">+ Insert</button>
+    </div>
+
+    <!-- Document area -->
+    <div class="doc-area" id="doc-area">
+      <div style="padding:40px;text-align:center;color:var(--text2)">
+        Select a collection from the sidebar to browse documents.
+      </div>
+    </div>
+
+    <!-- Pager -->
+    <div class="pager" id="pager" style="display:none">
+      <button onclick="prevPage()">Prev</button>
+      <span id="page-info"></span>
+      <button onclick="nextPage()">Next</button>
+    </div>
+  </div>
+</div>
+
+<!-- Insert Modal -->
+<div class="modal-overlay" id="insert-modal">
+  <div class="modal">
+    <div class="modal-header">
+      <span>Insert Document</span>
+      <button onclick="hideInsertModal()">X</button>
+    </div>
+    <div class="modal-body">
+      <textarea id="insert-json" placeholder='{"name": "Alice", "age": 30}'></textarea>
+    </div>
+    <div class="modal-footer">
+      <button onclick="hideInsertModal()">Cancel</button>
+      <button class="primary" onclick="doInsert()">Insert</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const API = '';
+let currentCS = null, currentCL = null;
+let page = 0, pageSize = 20;
+
+// --- API helpers ---
+async function api(path, opts = {}) {
+  const res = await fetch(API + path, {
+    headers: { 'Content-Type': 'application/json' },
+    ...opts,
+  });
+  return res.json();
+}
+
+function toast(msg, type = 'success') {
+  const el = document.createElement('div');
+  el.className = 'toast ' + type;
+  el.textContent = msg;
+  document.body.appendChild(el);
+  setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 300); }, 2500);
+}
+
+// --- Status ---
+async function checkStatus() {
+  try {
+    const r = await api('/api/status');
+    const dot = document.getElementById('status-dot');
+    const txt = document.getElementById('status-text');
+    if (r.ok && r.data.connected) {
+      dot.className = 'ok'; dot.id = 'status-dot';
+      dot.title = 'Connected';
+      txt.textContent = `Connected to ${r.data.sdb_host}:${r.data.sdb_port}`;
+    } else {
+      dot.className = ''; dot.id = 'status-dot';
+      txt.textContent = 'Disconnected';
+    }
+  } catch(e) {
+    document.getElementById('status-text').textContent = 'REST API unreachable';
+  }
+}
+
+// --- Tree ---
+async function refreshTree() {
+  const tree = document.getElementById('tree');
+  const r = await api('/api/databases');
+  if (!r.ok) { toast(r.error, 'error'); return; }
+
+  tree.innerHTML = '';
+  for (const cs of r.data) {
+    const name = cs.Name || cs.name || Object.values(cs)[0];
+    const div = document.createElement('div');
+    div.className = 'cs-item';
+    div.innerHTML = `
+      <div class="cs-header" onclick="toggleCS(this, '${name}')">
+        <span class="arrow">&#9654;</span> ${name}
+      </div>
+      <div class="cl-list" data-cs="${name}"></div>
+    `;
+    tree.appendChild(div);
+  }
+}
+
+async function toggleCS(header, csName) {
+  const arrow = header.querySelector('.arrow');
+  const list = header.nextElementSibling;
+
+  if (list.classList.contains('open')) {
+    list.classList.remove('open');
+    arrow.classList.remove('open');
+    return;
+  }
+
+  arrow.classList.add('open');
+  list.classList.add('open');
+  list.innerHTML = '<div style="padding:4px 12px;font-size:11px;color:var(--text2)">Loading...</div>';
+
+  const r = await api(`/api/databases/${csName}/collections`);
+  if (!r.ok) { list.innerHTML = `<div style="padding:4px 12px;color:var(--error);font-size:11px">${r.error}</div>`; return; }
+
+  list.innerHTML = '';
+
+  // Add collection create button
+  const addBtn = document.createElement('div');
+  addBtn.className = 'cl-item';
+  addBtn.style.color = 'var(--accent)';
+  addBtn.textContent = '+ Collection';
+  addBtn.onclick = () => promptCreateCL(csName);
+  list.appendChild(addBtn);
+
+  for (const cl of r.data) {
+    const clName = cl.Name || cl.name || Object.values(cl)[0];
+    // Strip "cs." prefix if present
+    const shortName = clName.includes('.') ? clName.split('.').pop() : clName;
+    const item = document.createElement('div');
+    item.className = 'cl-item';
+    item.textContent = shortName;
+    item.onclick = () => selectCollection(csName, shortName, item);
+    list.appendChild(item);
+  }
+}
+
+function selectCollection(cs, cl, el) {
+  document.querySelectorAll('.cl-item.active').forEach(e => e.classList.remove('active'));
+  if (el) el.classList.add('active');
+  currentCS = cs; currentCL = cl; page = 0;
+  document.getElementById('doc-toolbar').style.display = 'flex';
+  document.getElementById('current-path').textContent = `${cs}.${cl}`;
+  loadDocs();
+}
+
+// --- Documents ---
+async function loadDocs() {
+  if (!currentCS || !currentCL) return;
+  const area = document.getElementById('doc-area');
+  area.innerHTML = '<div style="padding:20px;color:var(--text2)">Loading...</div>';
+
+  const filter = document.getElementById('filter-input').value.trim();
+  let url = `/api/databases/${currentCS}/collections/${currentCL}/documents?skip=${page * pageSize}&limit=${pageSize}`;
+  if (filter) url += `&filter=${encodeURIComponent(filter)}`;
+
+  const r = await api(url);
+  if (!r.ok) { area.innerHTML = `<div style="padding:20px;color:var(--error)">${r.error}</div>`; return; }
+
+  if (r.data.length === 0) {
+    area.innerHTML = '<div style="padding:20px;color:var(--text2)">No documents found.</div>';
+    document.getElementById('pager').style.display = 'none';
+    return;
+  }
+
+  area.innerHTML = '';
+  for (const doc of r.data) {
+    const card = document.createElement('div');
+    card.className = 'doc-card';
+    card.innerHTML = `
+      <pre>${syntaxHighlight(JSON.stringify(doc, null, 2))}</pre>
+      <div class="doc-actions">
+        <button class="danger" onclick='deleteDoc(${JSON.stringify(JSON.stringify(doc))})'>Delete</button>
+      </div>
+    `;
+    area.appendChild(card);
+  }
+
+  // Pager
+  const pager = document.getElementById('pager');
+  pager.style.display = 'flex';
+  document.getElementById('page-info').textContent = `Page ${page + 1} (${r.data.length} docs)`;
+}
+
+function prevPage() { if (page > 0) { page--; loadDocs(); } }
+function nextPage() { page++; loadDocs(); }
+
+async function deleteDoc(docJson) {
+  if (!confirm('Delete this document?')) return;
+  const doc = JSON.parse(docJson);
+  // Use _id if available, otherwise use the whole doc as condition
+  const condition = doc._id ? { _id: doc._id } : doc;
+  const r = await api(`/api/databases/${currentCS}/collections/${currentCL}/documents`, {
+    method: 'DELETE',
+    body: JSON.stringify(condition),
+  });
+  if (r.ok) { toast('Document deleted'); loadDocs(); }
+  else toast(r.error, 'error');
+}
+
+// --- Insert ---
+function showInsertModal() { document.getElementById('insert-modal').classList.add('show'); }
+function hideInsertModal() { document.getElementById('insert-modal').classList.remove('show'); }
+
+async function doInsert() {
+  const raw = document.getElementById('insert-json').value.trim();
+  let body;
+  try { body = JSON.parse(raw); } catch(e) { toast('Invalid JSON: ' + e.message, 'error'); return; }
+
+  const r = await api(`/api/databases/${currentCS}/collections/${currentCL}/documents`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+  if (r.ok) { toast('Document inserted'); hideInsertModal(); document.getElementById('insert-json').value = ''; loadDocs(); }
+  else toast(r.error, 'error');
+}
+
+// --- SQL ---
+async function execSql() {
+  const sql = document.getElementById('sql-input').value.trim();
+  if (!sql) return;
+
+  const area = document.getElementById('doc-area');
+  area.innerHTML = '<div style="padding:20px;color:var(--text2)">Executing...</div>';
+  document.getElementById('doc-toolbar').style.display = 'none';
+  document.getElementById('pager').style.display = 'none';
+
+  const r = await api('/api/sql', { method: 'POST', body: JSON.stringify({ sql }) });
+  if (r.ok) {
+    area.innerHTML = `<div class="result-panel"><pre>${syntaxHighlight(JSON.stringify(r.data, null, 2))}</pre></div>`;
+  } else {
+    area.innerHTML = `<div style="padding:20px;color:var(--error)">${r.error}</div>`;
+  }
+}
+
+// --- Create CS/CL ---
+async function promptCreateCS() {
+  const name = prompt('Collection space name:');
+  if (!name) return;
+  const r = await api(`/api/databases/${name}`, { method: 'POST' });
+  if (r.ok) { toast('Created ' + name); refreshTree(); }
+  else toast(r.error, 'error');
+}
+
+async function promptCreateCL(cs) {
+  const name = prompt(`Collection name in ${cs}:`);
+  if (!name) return;
+  const r = await api(`/api/databases/${cs}/collections/${name}`, { method: 'POST' });
+  if (r.ok) { toast(`Created ${cs}.${name}`); refreshTree(); }
+  else toast(r.error, 'error');
+}
+
+// --- Syntax highlighting ---
+function syntaxHighlight(json) {
+  return json.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/("(\\u[\da-fA-F]{4}|\\[^u]|[^\\"])*"(\s*:)?)/g, (match) => {
+      let cls = 'color:#e94560'; // key
+      if (/:\s*$/.test(match)) cls = 'color:#e94560';
+      else cls = 'color:#4caf50'; // string value
+      return `<span style="${cls}">${match}</span>`;
+    })
+    .replace(/\b(-?\d+\.?\d*([eE][+-]?\d+)?)\b/g, '<span style="color:#2196f3">$1</span>')
+    .replace(/\b(true|false)\b/g, '<span style="color:#ff9800">$1</span>')
+    .replace(/\bnull\b/g, '<span style="color:#9e9e9e">null</span>');
+}
+
+// --- Init ---
+checkStatus();
+refreshTree();
+setInterval(checkStatus, 30000);
+</script>
+</body>
+</html>
