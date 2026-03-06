@@ -5,3 +5,14 @@ Cargo.lock
 .DS_Store
 .idea/
 .vscode/
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+
+# Java
+drivers/java/target/
+
+# pytest
+.pytest_cache/

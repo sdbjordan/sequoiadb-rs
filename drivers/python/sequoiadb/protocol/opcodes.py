@@ -1,0 +1,20 @@
+"""OpCode constants matching SequoiaDB C++ protocol."""
+
+
+class OpCode:
+    MSG_REQ = 1000
+    UPDATE_REQ = 2001
+    INSERT_REQ = 2002
+    SQL_REQ = 2003
+    QUERY_REQ = 2004
+    GET_MORE_REQ = 2005
+    DELETE_REQ = 2006
+    KILL_CONTEXT_REQ = 2007
+    DISCONNECT = 2008
+    TRANS_BEGIN_REQ = 2010
+    TRANS_COMMIT_REQ = 2011
+    TRANS_ROLLBACK_REQ = 2012
+    AGGREGATE_REQ = 2019
+
+
+REPLY_MASK = 0x40000000
